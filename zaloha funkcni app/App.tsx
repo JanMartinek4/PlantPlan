@@ -1,0 +1,2601 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  DndContext,
+  PointerSensor,
+  closestCenter,
+  pointerWithin,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import type { DragEndEvent } from "@dnd-kit/core";
+
+// =====================================================
+// 14denní plánovač – prototyp "tabulka + řádky"
+//
+// Nově:
+// - Experiment je rám (segment bez textu)
+// - Uvnitř experimentu lze přidávat denní tasky (stack v buňce)
+//   * klik na den UVNITŘ experimentu => přidá sub-task do experimentu
+//   * klik mimo experiment => přidá samostatný task (1 den)
+// - Drag experimentu posouvá i jeho vnitřní tasky (relativně)
+// =====================================================
+
+// ---------------------------------------------
+// Types
+// ---------------------------------------------
+
+type DayKey = string; // YYYY-MM-DD
+
+type ItemType = "task" | "experiment";
+
+type ViewMode = "plan" | "calendar";
+
+type TaskRef = {
+  id: string; // stable id across views
+  title: string;
+  day: DayKey;
+  color: string;
+  kind: "task" | "subtask";
+  meta: any;
+};
+
+type TimedEvent = {
+  id: string; // matches TaskRef.id
+  day: DayKey;
+  startMin: number; // minutes from 00:00
+  endMin: number;
+};
+
+type RecurringEvent = {
+  id: string;
+  title: string;
+  color: string;
+  weekday: number; // 0=Sun..6=Sat (UTC)
+  startMin: number;
+  endMin: number;
+};
+
+type PersistedStateV1 = {
+  version: 1;
+  windowStart: DayKey;
+  windowLen: 7 | 14 | 28;
+  viewMode: ViewMode;
+  calendarDaysLen: 3 | 5 | 7;
+  projects: Project[];
+  timedEvents: Record<string, TimedEvent>;
+  recurring: RecurringEvent[];
+};
+
+const STORAGE_KEY = "pmorph_planner_v1";
+
+type ExperimentSubTask = {
+  id: string;
+  width: number;
+  title: string;
+  day: DayKey;
+};
+
+type LaneItem =
+  | {
+      id: string;
+      type: "task";
+      title: string;
+      start: DayKey; // inclusive
+      end: DayKey; // inclusive (== start)
+    }
+  | {
+      id: string;
+      type: "experiment";
+      title: string; // unused (kept for compatibility)
+      start: DayKey; // inclusive
+      end: DayKey; // inclusive
+      subTasks: Record<DayKey, ExperimentSubTask[]>; // stack per day
+    };
+
+type Lane = {
+  id: string;
+  items: LaneItem[];
+};
+
+type Project = {
+  id: string;
+  name: string;
+  color: string;
+  lanes: Lane[];
+};
+
+type Selection =
+  | {
+      kind: "item";
+      projectId: string;
+      itemId: string;
+    }
+  | {
+      kind: "subtask";
+      projectId: string;
+      experimentId: string;
+      subTaskId: string;
+    }
+  | null;
+
+type DragCreate = {
+  projectId: string;
+  laneId: string;
+  startDay: DayKey;
+  currentDay: DayKey;
+  pointerId: number;
+  moved: boolean; // true pokud se kurzor dostal do jiného dne (range)
+} | null;
+
+type ResizeExp = {
+  projectId: string;
+  laneId: string;
+  expId: string;
+  edge: "start" | "end";
+  pointerId: number;
+} | null;
+
+// ---------------------------------------------
+// Date utils (UTC-safe)
+// ---------------------------------------------
+
+function parseDay(day: DayKey): Date {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+function formatDay(date: Date): DayKey {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function addDays(day: DayKey, delta: number): DayKey {
+  const dt = parseDay(day);
+  dt.setUTCDate(dt.getUTCDate() + delta);
+  return formatDay(dt);
+}
+
+function diffDays(from: DayKey, to: DayKey): number {
+  const a = parseDay(from).getTime();
+  const b = parseDay(to).getTime();
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  return Math.round((b - a) / MS_PER_DAY);
+}
+
+function compareDay(a: DayKey, b: DayKey): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function todayUTC(): DayKey {
+  const now = new Date();
+  const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  return formatDay(dt);
+}
+
+function dayLabel(day: DayKey) {
+  const dt = parseDay(day);
+  const weekday = dt.toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" });
+  const md = dt.toLocaleDateString(undefined, { month: "numeric", day: "2-digit", timeZone: "UTC" });
+  return { weekday, md };
+}
+
+// ---------------------------------------------
+// Scheduling helpers
+// ---------------------------------------------
+
+function overlaps(a: { start: DayKey; end: DayKey }, b: { start: DayKey; end: DayKey }) {
+  // inclusive overlap
+  return !(compareDay(a.end, b.start) < 0 || compareDay(b.end, a.start) < 0);
+}
+
+function sortLaneItems(items: LaneItem[]) {
+  return items
+    .slice()
+    .sort((x, y) => {
+      const c = compareDay(x.start, y.start);
+      if (c !== 0) return c;
+      return x.id.localeCompare(y.id);
+    });
+}
+
+function canPlaceInLane(lane: Lane, candidate: LaneItem, ignoreItemId?: string) {
+  for (const it of lane.items) {
+    if (ignoreItemId && it.id === ignoreItemId) continue;
+    if (overlaps(it, candidate)) return false;
+  }
+  return true;
+}
+
+function upsertIntoLane(lane: Lane, candidate: LaneItem, ignoreItemId?: string): Lane {
+  const filtered = ignoreItemId ? lane.items.filter((i) => i.id !== ignoreItemId) : lane.items.slice();
+  filtered.push(candidate);
+  return { ...lane, items: sortLaneItems(filtered) };
+}
+
+function removeFromLanes(lanes: Lane[], itemId: string): Lane[] {
+  return lanes
+    .map((l) => ({ ...l, items: l.items.filter((i) => i.id !== itemId) }))
+    .filter((l) => l.items.length > 0);
+}
+
+function ensureAtLeastOneLane(lanes: Lane[]): Lane[] {
+  return lanes.length ? lanes : [{ id: `lane_${crypto.randomUUID()}`, items: [] }];
+}
+
+function placeItemPacked(project: Project, preferredLaneId: string | null, item: LaneItem, ignoreItemId?: string): Project {
+  // Remove first (so we can re-place cleanly)
+  let lanes = removeFromLanes(project.lanes, ignoreItemId ?? item.id);
+
+  // Try preferred lane first
+  if (preferredLaneId) {
+    const idx = lanes.findIndex((l) => l.id === preferredLaneId);
+    if (idx !== -1 && canPlaceInLane(lanes[idx], item, ignoreItemId)) {
+      lanes[idx] = upsertIntoLane(lanes[idx], item, ignoreItemId);
+      return { ...project, lanes: ensureAtLeastOneLane(lanes) };
+    }
+  }
+
+  // Try any existing lane
+  for (let i = 0; i < lanes.length; i++) {
+    if (canPlaceInLane(lanes[i], item, ignoreItemId)) {
+      lanes[i] = upsertIntoLane(lanes[i], item, ignoreItemId);
+      return { ...project, lanes: ensureAtLeastOneLane(lanes) };
+    }
+  }
+
+  // Create new lane
+  const newLane: Lane = {
+    id: `lane_${crypto.randomUUID()}`,
+    items: [item],
+  };
+  lanes.push(newLane);
+  return { ...project, lanes: ensureAtLeastOneLane(lanes) };
+}
+
+function findLane(project: Project, laneId: string): Lane | null {
+  return project.lanes.find((l) => l.id === laneId) ?? null;
+}
+
+function findExperimentAtDay(lane: Lane, day: DayKey): LaneItem | null {
+  for (const it of lane.items) {
+    if (it.type !== "experiment") continue;
+    if (compareDay(it.start, day) <= 0 && compareDay(day, it.end) <= 0) return it;
+  }
+  return null;
+}
+
+function shiftExperimentSubtasks(subTasks: Record<DayKey, ExperimentSubTask[]>, delta: number) {
+  const out: Record<DayKey, ExperimentSubTask[]> = {};
+  for (const [day, arr] of Object.entries(subTasks)) {
+    const nd = addDays(day, delta);
+    out[nd] = arr.map((t) => ({ ...t, day: nd }));
+  }
+  return out;
+}
+
+function subTaskBounds(exp: Extract<LaneItem, { type: "experiment" }>): { min: DayKey; max: DayKey } | null {
+  const days = Object.keys(exp.subTasks);
+  if (!days.length) return null;
+  let min = days[0];
+  let max = days[0];
+  for (const d of days) {
+    if (compareDay(d, min) < 0) min = d;
+    if (compareDay(d, max) > 0) max = d;
+  }
+  return { min, max };
+}
+
+// ---------------------------------------------
+// DnD ID helpers
+// ---------------------------------------------
+
+// Draggable IDs:
+// item:<projId>:<laneId>:<itemId>
+// subtask:<projId>:<laneId>:<expId>:<subTaskId>
+//
+// Droppable IDs:
+// cell:<projId>:<laneId>:<day>
+// expday:<projId>:<laneId>:<expId>:<day>
+
+function splitId(id: string) {
+  return id.split(":");
+}
+
+function isPrefix(id: string, prefix: string) {
+  return id.startsWith(prefix + ":");
+}
+
+function ExpDayDroppable({
+  id,
+  title,
+  style,
+  onClick,
+  onPointerDown,
+}: {
+  id: string;
+  title?: string;
+  style: React.CSSProperties;
+  onClick?: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onPointerDown?: (e: React.PointerEvent<HTMLDivElement>) => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id });
+  return (
+    <div
+      ref={setNodeRef}
+      className={"pointer-events-auto absolute " + (isOver ? "ring-2 ring-zinc-400" : "")}
+      style={style}
+      title={title}
+      onPointerDown={onPointerDown}
+      onClick={onClick}
+    />
+  );
+}
+
+// ---------------------------------------------
+// UI blocks
+// ---------------------------------------------
+
+function Draggable({
+  id,
+  children,
+  className = "",
+}: {
+  id: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  // dnd-kit sometimes benefits from disabling browser gestures on draggable nodes
+  // (especially trackpads / touch).
+
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id });
+  const style: React.CSSProperties = transform
+    ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` }
+    : undefined;
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ ...style, touchAction: "none" }}
+      className={(className ? className + " " : "") + (isDragging ? "opacity-60" : "")}
+      {...attributes}
+      {...listeners}
+    >
+      {children}
+    </div>
+  );
+}
+
+function deleteItemFromProject(project: Project, itemId: string): Project {
+  const lanes = project.lanes
+    .map((l) => ({ ...l, items: l.items.filter((i) => i.id !== itemId) }))
+    .filter((l) => l.items.length > 0);
+  return { ...project, lanes: ensureAtLeastOneLane(lanes) };
+}
+
+function DroppableCell({
+  id,
+  width,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  className = "",
+}: {
+  id: string;
+  onPointerDown?: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onPointerMove?: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onPointerUp?: (e: React.PointerEvent<HTMLDivElement>) => void;
+  className?: string;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id });
+  return (
+    <div
+      ref={setNodeRef}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      style={{ width }}
+      className={
+        "relative h-20 border border-zinc-200 bg-white " +
+        (isOver ? "ring-2 ring-zinc-400" : "") +
+        " cursor-pointer hover:bg-zinc-50 " +
+        className
+      }
+    />
+  );
+}
+
+function Segment({
+  item,
+  color,
+  selected,
+  onDelete,
+  onSelect,
+  onUpdateTitle,
+}: {
+  item: LaneItem;
+  color: string;
+  selected?: boolean;
+  onDelete?: () => void;
+  onSelect?: () => void;
+  onUpdateTitle?: (title: string) => void;
+}) {
+  const bg = item.type === "task" ? color : color + "22";
+  const border = item.type === "task" ? "transparent" : color;
+
+  const [draftTitle, setDraftTitle] = useState(item.type === "task" ? item.title : "");
+  useEffect(() => {
+    if (selected && item.type === "task") setDraftTitle(item.title);
+  }, [selected, item]);
+
+  function commitTitle() {
+    if (item.type !== "task") return;
+    const t = draftTitle.trim();
+    if (!t) {
+      setDraftTitle(item.title);
+      return;
+    }
+    if (t !== item.title) onUpdateTitle?.(t);
+  }
+
+  return (
+    <div
+      className="group relative h-full"
+      onClick={(e) => {
+        e.stopPropagation();
+        onSelect?.();
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        const el = (e.currentTarget as HTMLDivElement).querySelector(
+          "input[data-title-editor='1']"
+        ) as HTMLInputElement | null;
+        el?.focus();
+        el?.select();
+      }}
+    >
+      <div
+        className={
+          (item.type === "experiment" ? "h-full" : "h-10") +
+          " rounded-md shadow-sm " +
+          (item.type === "task"
+            ? "px-2 py-1"
+            : "border-2" + (selected ? " ring-2 ring-zinc-900/40" : ""))
+        }
+        style={{ background: bg, borderColor: border }}
+      >
+        {item.type === "task" && (
+          <div className="truncate text-xs font-semibold text-white">{item.title}</div>
+        )}
+      </div>
+
+      {/* Inline editor only for standalone tasks (MVP) */}
+      {selected && item.type === "task" && (
+        <div
+          className="absolute left-0 top-full z-20 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              data-title-editor="1"
+              className="h-8 w-full rounded-lg border border-zinc-200 px-2 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
+              value={draftTitle}
+              onChange={(e) => setDraftTitle(e.target.value)}
+              onBlur={() => commitTitle()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  (e.currentTarget as HTMLInputElement).blur();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setDraftTitle(item.title);
+                  (e.currentTarget as HTMLInputElement).blur();
+                }
+              }}
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <button
+              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+              onClick={() => onDelete?.()}
+            >
+              Smazat
+            </button>
+          </div>
+        </div>
+      )}
+
+      {onDelete && (
+        <button
+          className={
+            "absolute -right-2 -top-2 h-6 w-6 rounded-full border border-zinc-200 bg-white text-xs shadow-sm " +
+            "opacity-0 transition-opacity group-hover:opacity-100 " +
+            (selected ? "opacity-100" : "")
+          }
+          title="Smazat"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+        >
+          ✕
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SubTaskPill({
+  text,
+  color,
+  selected,
+  onSelect,
+  onDelete,
+  onUpdateTitle,
+}: {
+  text: string;
+  color: string;
+  selected?: boolean;
+  onSelect?: () => void;
+  onDelete?: () => void;
+  onUpdateTitle?: (t: string) => void;
+}) {
+  const [draft, setDraft] = useState(text);
+  useEffect(() => {
+    if (selected) setDraft(text);
+  }, [selected, text]);
+
+  function commit() {
+    const t = draft.trim();
+    if (!t) {
+      setDraft(text);
+      return;
+    }
+    if (t !== text) onUpdateTitle?.(t);
+  }
+
+  return (
+    <div className="relative">
+      <div
+        className={
+          "truncate rounded-md px-1.5 py-0.5 text-[10px] font-medium text-white " +
+          (selected ? "ring-2 ring-zinc-900/30" : "")
+        }
+        style={{ background: color }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelect?.();
+        }}
+        title={text}
+      >
+        {text}
+      </div>
+
+      {selected && (
+        <div
+          className="absolute left-0 top-full z-30 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg"
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              className="h-8 w-full rounded-lg border border-zinc-200 px-2 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={() => commit()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  (e.currentTarget as HTMLInputElement).blur();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setDraft(text);
+                  (e.currentTarget as HTMLInputElement).blur();
+                }
+              }}
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <button
+              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+              onClick={() => onDelete?.()}
+            >
+              Smazat
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------
+// Demo seed
+// ---------------------------------------------
+
+function seed(base: DayKey): Project[] {
+  const exp1: LaneItem = {
+    id: "i2",
+    type: "experiment",
+    title: "",
+    start: addDays(base, 2),
+    end: addDays(base, 8),
+    subTasks: {
+      [addDays(base, 2)]: [{ id: "st1", title: "Semínka na plotny + lednice", day: addDays(base, 2) }],
+      [addDays(base, 4)]: [{ id: "st2", title: "Vyndat z lednice → box", day: addDays(base, 4) }],
+      [addDays(base, 7)]: [
+        { id: "st3", title: "Mikroskop", day: addDays(base, 7) },
+        { id: "st4", title: "Záloha dat", day: addDays(base, 7) },
+      ],
+    },
+  };
+
+  const p1: Project = {
+    id: "p1",
+    name: "project1",
+    color: "#f59e0b",
+    lanes: [
+      {
+        id: "l1",
+        items: [
+          { id: "i1", type: "task", title: "Samostatný task", start: addDays(base, 1), end: addDays(base, 1) },
+          exp1,
+          { id: "i4", type: "task", title: "Další task", start: addDays(base, 6), end: addDays(base, 6) },
+        ],
+      },
+    ],
+  };
+
+  const p2: Project = {
+    id: "p2",
+    name: "Project 2",
+    color: "#22c55e",
+    lanes: [
+      {
+        id: "l1",
+        items: [
+          { id: "j1", type: "task", title: "task1", start: addDays(base, 0), end: addDays(base, 0) },
+          {
+            id: "j2",
+            type: "experiment",
+            title: "",
+            start: addDays(base, 2),
+            end: addDays(base, 5),
+            subTasks: {},
+          },
+        ],
+      },
+    ],
+  };
+
+  p1.lanes = p1.lanes.map((l) => ({ ...l, items: sortLaneItems(l.items) }));
+  p2.lanes = p2.lanes.map((l) => ({ ...l, items: sortLaneItems(l.items) }));
+  return [p1, p2];
+}
+
+// ---------------------------------------------
+// Main
+// ---------------------------------------------
+
+export default function App() {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const readStored = (): PersistedStateV1 | null => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== 1) return null;
+      return parsed as PersistedStateV1;
+    } catch {
+      return null;
+    }
+  };
+
+  const writeStored = (state: PersistedStateV1) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // ignore (quota / private mode)
+    }
+  };
+  const stored = readStored();
+
+  const [windowStart, setWindowStart] = useState<DayKey>(() => stored?.windowStart ?? addDays(todayUTC(), -2));
+  const [viewMode, setViewMode] = useState<ViewMode>(() => stored?.viewMode ?? "plan");
+  const [calendarDaysLen, setCalendarDaysLen] = useState<3 | 5 | 7>(() => stored?.calendarDaysLen ?? 5);
+  const [timedEvents, setTimedEvents] = useState<Record<string, TimedEvent>>(() => stored?.timedEvents ?? {});
+  const [recurring, setRecurring] = useState<RecurringEvent[]>(() =>
+    stored?.recurring ?? [
+      { id: "r1", title: "Meeting s Matesem", color: "#0ea5e9", weekday: 4, startMin: 9 * 60, endMin: 10 * 60 }, // Čt
+      { id: "r2", title: "Seminář ústavu", color: "#a855f7", weekday: 3, startMin: 13 * 60, endMin: 14 * 60 }, // St
+    ]
+  );
+  const [recurringModal, setRecurringModal] = useState(false);
+  const [resizeEvt, setResizeEvt] = useState<{ id: string; pointerId: number } | null>(null);
+  const [windowLen, setWindowLen] = useState<7 | 14 | 28>(() => stored?.windowLen ?? 14);
+  const [projects, setProjects] = useState<Project[]>(() => stored?.projects ?? seed(stored?.windowStart ?? windowStart));
+  const [dayFocus, setDayFocus] = useState<DayKey | null>(null);
+  const [selection, setSelection] = useState<Selection>(null);
+  const [dragCreate, setDragCreate] = useState<DragCreate>(null);
+  const [resizeExp, setResizeExp] = useState<ResizeExp>(null);
+
+  const makeSnapshot = (): PersistedStateV1 => ({
+    version: 1,
+    windowStart,
+    windowLen,
+    viewMode,
+    calendarDaysLen,
+    projects,
+    timedEvents,
+    recurring,
+  });
+
+  // Auto-save (debounced)
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      writeStored(makeSnapshot());
+    }, 250);
+    return () => window.clearTimeout(t);
+  }, [windowStart, windowLen, viewMode, calendarDaysLen, projects, timedEvents, recurring]);
+
+  const exportJSON = () => {
+    const data = JSON.stringify(makeSnapshot(), null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "planner.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const importJSON = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed || parsed.version !== 1) return;
+      const s = parsed as PersistedStateV1;
+      setWindowStart(s.windowStart);
+      setWindowLen(s.windowLen);
+      setViewMode(s.viewMode);
+      setCalendarDaysLen(s.calendarDaysLen);
+      setProjects(s.projects);
+      setTimedEvents(s.timedEvents);
+      setRecurring(s.recurring);
+      // close transient UI
+      setSelection(null);
+      setDragCreate(null);
+      setResizeExp(null);
+      setDayFocus(null);
+      setRecurringModal(false);
+      // persist immediately
+      writeStored(s);
+    } catch {
+      // ignore
+    }
+  };
+
+  const days = useMemo(
+    () => Array.from({ length: windowLen }, (_, i) => addDays(windowStart, i)),
+    [windowStart, windowLen]
+  );
+
+  const calDays = useMemo(
+    () => Array.from({ length: calendarDaysLen }, (_, i) => addDays(windowStart, i)),
+    [windowStart, calendarDaysLen]
+  );
+
+  const taskCatalog = useMemo(() => {
+    const out: TaskRef[] = [];
+    for (const p of projects) {
+      for (const lane of p.lanes) {
+        for (const it of lane.items) {
+          if (it.type === "task") {
+            out.push({
+              id: `t:${p.id}:${it.id}`,
+              title: it.title,
+              day: it.start,
+              color: p.color,
+              kind: "task",
+              meta: { projectId: p.id, itemId: it.id },
+            });
+          } else {
+            for (const [day, arr] of Object.entries(it.subTasks)) {
+              for (const st of arr) {
+                out.push({
+                  id: `st:${p.id}:${it.id}:${st.id}`,
+                  title: st.title,
+                  day,
+                  color: p.color,
+                  kind: "subtask",
+                  meta: { projectId: p.id, experimentId: it.id, subTaskId: st.id },
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+    return out;
+  }, [projects]);
+
+  const inboxTasks = useMemo(() => {
+    const visible = taskCatalog.filter((t) => calDays.includes(t.day));
+    return visible.filter((t) => !timedEvents[t.id]);
+  }, [taskCatalog, timedEvents, calDays]);
+
+  const eventsForCal = useMemo(() => {
+    return Object.values(timedEvents).filter((e) => calDays.includes(e.day));
+  }, [timedEvents, calDays]);
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+
+  const collisionDetection = (args: any) => {
+    const within = pointerWithin(args);
+    return within.length ? within : closestCenter(args);
+  };
+
+  function onDragEnd(ev: DragEndEvent) {
+    const activeId = String(ev.active.id);
+    const overId = ev.over ? String(ev.over.id) : null;
+    if (!overId) return;
+
+    // 1) Move whole segments (task/experiment)
+    if (isPrefix(activeId, "item") && isPrefix(overId, "cell")) {
+      const [, pId, _fromLaneId, itemId] = splitId(activeId);
+      const [, p2Id, targetLaneId, targetDay] = splitId(overId);
+      if (pId !== p2Id) return;
+
+      setProjects((prev) => {
+        const next = structuredClone(prev) as Project[];
+        const pIdx = next.findIndex((p) => p.id === pId);
+        if (pIdx === -1) return prev;
+
+        const project = next[pIdx];
+
+        let found: { laneId: string; item: LaneItem } | null = null;
+        for (const l of project.lanes) {
+          const it = l.items.find((x) => x.id === itemId);
+          if (it) {
+            found = { laneId: l.id, item: it };
+            break;
+          }
+        }
+        if (!found) return prev;
+
+        const delta = diffDays(found.item.start, targetDay);
+
+        let moved: LaneItem;
+        if (found.item.type === "experiment") {
+          moved = {
+            ...found.item,
+            start: addDays(found.item.start, delta),
+            end: addDays(found.item.end, delta),
+            subTasks: shiftExperimentSubtasks(found.item.subTasks, delta),
+          };
+        } else {
+          moved = {
+            ...found.item,
+            start: addDays(found.item.start, delta),
+            end: addDays(found.item.end, delta),
+          };
+        }
+
+        next[pIdx] = placeItemPacked(project, targetLaneId, moved, found.item.id);
+        return next;
+      });
+      return;
+    }
+
+    // 2) Move subtask pill within an experiment (day-to-day)
+    if (isPrefix(activeId, "subtask") && isPrefix(overId, "expday")) {
+      const [, pId, laneId, expId, subTaskId] = splitId(activeId);
+      const [, p2Id, lane2Id, exp2Id, targetDay] = splitId(overId);
+      if (pId !== p2Id) return;
+      if (laneId !== lane2Id) return;
+      if (expId !== exp2Id) return;
+
+      setProjects((prev) => {
+        const next = structuredClone(prev) as Project[];
+        const pIdx = next.findIndex((p) => p.id === pId);
+        if (pIdx === -1) return prev;
+
+        const project = next[pIdx];
+        const lane = findLane(project, laneId);
+        if (!lane) return prev;
+
+        const exp = lane.items.find((it) => it.id === expId);
+        if (!exp || exp.type !== "experiment") return prev;
+
+        // Ensure target day is within experiment
+        if (compareDay(targetDay, exp.start) < 0 || compareDay(targetDay, exp.end) > 0) return prev;
+
+        // Find current day + remove
+        let currentDay: DayKey | null = null;
+        let foundTask: ExperimentSubTask | null = null;
+        const newSub: Record<DayKey, ExperimentSubTask[]> = {};
+
+        for (const [day, arr] of Object.entries(exp.subTasks)) {
+          const kept = arr.filter((t) => t.id !== subTaskId);
+          if (kept.length !== arr.length) {
+            currentDay = day;
+            foundTask = arr.find((t) => t.id === subTaskId) ?? null;
+          }
+          if (kept.length) newSub[day] = kept;
+        }
+
+        if (!foundTask) return prev;
+        if (currentDay === targetDay) return prev;
+
+        const movedTask: ExperimentSubTask = { ...foundTask, day: targetDay };
+        const bucket = newSub[targetDay] ? newSub[targetDay].slice() : [];
+        bucket.push(movedTask);
+        newSub[targetDay] = bucket;
+
+        const updatedExp: LaneItem = { ...exp, subTasks: newSub };
+        next[pIdx] = placeItemPacked(project, laneId, updatedExp, exp.id);
+        return next;
+      });
+
+      // keep selection on moved pill
+      setSelection((s) => {
+        if (!s || s.kind !== "subtask") return s;
+        if (s.projectId !== pId || s.experimentId !== expId || s.subTaskId !== subTaskId) return s;
+        return s;
+      });
+      return;
+    }
+  }
+
+  function addStandaloneTask(projectId: string, laneId: string, day: DayKey) {
+    const item: LaneItem = {
+      id: `it_${crypto.randomUUID()}`,
+      type: "task",
+      title: "task",
+      start: day,
+      end: day,
+    };
+
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+      next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
+      return next;
+    });
+  }
+
+  function addExperimentRange(projectId: string, laneId: string, start: DayKey, end: DayKey) {
+    const s = compareDay(start, end) <= 0 ? start : end;
+    const e = compareDay(start, end) <= 0 ? end : start;
+
+    const item: LaneItem = {
+      id: `it_${crypto.randomUUID()}`,
+      type: "experiment",
+      title: "",
+      start: s,
+      end: e,
+      subTasks: {},
+    };
+
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+      next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
+      return next;
+    });
+  }
+
+  function addExperimentSubTask(projectId: string, laneId: string, experimentId: string, day: DayKey) {
+    const createdId = `st_${crypto.randomUUID()}`;
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+
+      const project = next[pIdx];
+      const lane = findLane(project, laneId);
+      if (!lane) return prev;
+
+      const exp = lane.items.find((it) => it.id === experimentId);
+      if (!exp || exp.type !== "experiment") return prev;
+
+      const st: ExperimentSubTask = {
+        id: createdId,
+        title: "task",
+        day,
+      };
+
+      const bucket = exp.subTasks[day] ? exp.subTasks[day].slice() : [];
+      bucket.push(st);
+
+      const updatedExp: LaneItem = {
+        ...exp,
+        subTasks: { ...exp.subTasks, [day]: bucket },
+      };
+
+      next[pIdx] = placeItemPacked(project, laneId, updatedExp, exp.id);
+      return next;
+    });
+
+    setSelection({ kind: "subtask", projectId, experimentId, subTaskId: createdId });
+  }
+
+  function updateExperimentSubTaskTitle(projectId: string, experimentId: string, subTaskId: string, title: string) {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+
+      const project = next[pIdx];
+      let updated = false;
+
+      for (const lane of project.lanes) {
+        const exp = lane.items.find((it) => it.id === experimentId);
+        if (!exp || exp.type !== "experiment") continue;
+
+        const newSub: Record<DayKey, ExperimentSubTask[]> = {};
+        for (const [day, arr] of Object.entries(exp.subTasks)) {
+          newSub[day] = arr.map((t) => (t.id === subTaskId ? { ...t, title } : t));
+          if (arr.some((t) => t.id === subTaskId)) updated = true;
+        }
+
+        if (updated) {
+          const updatedExp: LaneItem = { ...exp, subTasks: newSub };
+          next[pIdx] = placeItemPacked(project, lane.id, updatedExp, exp.id);
+          return next;
+        }
+      }
+
+      return prev;
+    });
+  }
+
+  function deleteExperimentSubTask(projectId: string, experimentId: string, subTaskId: string) {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+
+      const project = next[pIdx];
+
+      for (const lane of project.lanes) {
+        const exp = lane.items.find((it) => it.id === experimentId);
+        if (!exp || exp.type !== "experiment") continue;
+
+        const newSub: Record<DayKey, ExperimentSubTask[]> = {};
+        let changed = false;
+        for (const [day, arr] of Object.entries(exp.subTasks)) {
+          const filtered = arr.filter((t) => t.id !== subTaskId);
+          if (filtered.length !== arr.length) changed = true;
+          if (filtered.length) newSub[day] = filtered;
+        }
+
+        if (changed) {
+          const updatedExp: LaneItem = { ...exp, subTasks: newSub };
+          next[pIdx] = placeItemPacked(project, lane.id, updatedExp, exp.id);
+          return next;
+        }
+      }
+
+      return prev;
+    });
+
+    setSelection((s) => (s && s.kind === "subtask" && s.projectId === projectId && s.subTaskId === subTaskId ? null : s));
+  }
+
+  function startRange(projectId: string, laneId: string, day: DayKey, pointerId: number) {
+    if (resizeExp) return;
+    setSelection(null);
+    setDragCreate({ projectId, laneId, startDay: day, currentDay: day, pointerId, moved: false });
+  }
+
+  function updateRange(day: DayKey) {
+    if (resizeExp) return;
+    setDragCreate((s) => (s ? { ...s, currentDay: day, moved: true } : s));
+  }
+
+  function finishRange(pointerId: number, clickedDay: DayKey, clickedExperimentId: string | null) {
+    if (resizeExp) return;
+    // klik (bez přejetí do jiného dne):
+    // - pokud klik padá do experimentu → subtask do experimentu
+    // - jinak standalone task
+    setDragCreate((s) => {
+      if (!s) return s;
+      if (s.pointerId !== pointerId) return s;
+
+      if (!s.moved || s.startDay === s.currentDay) {
+        if (clickedExperimentId) {
+          addExperimentSubTask(s.projectId, s.laneId, clickedExperimentId, clickedDay);
+        } else {
+          addStandaloneTask(s.projectId, s.laneId, clickedDay);
+        }
+      } else {
+        addExperimentRange(s.projectId, s.laneId, s.startDay, s.currentDay);
+      }
+
+      return null;
+    });
+  }
+
+  function updateItemTitle(projectId: string, itemId: string, title: string) {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+      const project = next[pIdx];
+
+      let found: { laneId: string; item: LaneItem } | null = null;
+      for (const l of project.lanes) {
+        const it = l.items.find((x) => x.id === itemId);
+        if (it) {
+          found = { laneId: l.id, item: it };
+          break;
+        }
+      }
+      if (!found) return prev;
+
+      if (found.item.type !== "task") return prev;
+
+      const updated: LaneItem = { ...found.item, title };
+      next[pIdx] = placeItemPacked(project, found.laneId, updated, found.item.id);
+      return next;
+    });
+  }
+
+  function deleteItem(projectId: string, itemId: string) {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+      next[pIdx] = deleteItemFromProject(next[pIdx], itemId);
+      return next;
+    });
+    setSelection((s) => (s && s.kind === "item" && s.projectId === projectId && s.itemId === itemId ? null : s));
+  }
+
+  function updateExperimentRange(projectId: string, laneId: string, expId: string, patch: { start?: DayKey; end?: DayKey }) {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+      const project = next[pIdx];
+      const lane = findLane(project, laneId);
+      if (!lane) return prev;
+      const exp = lane.items.find((it) => it.id === expId);
+      if (!exp || exp.type !== "experiment") return prev;
+
+      const bounds = subTaskBounds(exp);
+      let ns = patch.start ?? exp.start;
+      let ne = patch.end ?? exp.end;
+
+      // enforce ordering
+      if (compareDay(ns, ne) > 0) {
+        if (patch.start) ns = ne;
+        if (patch.end) ne = ns;
+      }
+
+      // don't shrink past internal subtasks
+      if (bounds) {
+        if (compareDay(ns, bounds.min) > 0) ns = bounds.min;
+        if (compareDay(ne, bounds.max) < 0) ne = bounds.max;
+      }
+
+      const updated: LaneItem = { ...exp, start: ns, end: ne };
+
+      // only allow if it doesn't overlap other lane items
+      if (!canPlaceInLane(lane, updated, exp.id)) return prev;
+
+      const newLane = upsertIntoLane(lane, updated, exp.id);
+      const newLanes = project.lanes.map((l) => (l.id === laneId ? newLane : l));
+      next[pIdx] = { ...project, lanes: newLanes };
+      return next;
+    });
+  }
+
+  function startResize(projectId: string, laneId: string, expId: string, edge: "start" | "end", pointerId: number) {
+    setSelection({ kind: "item", projectId, itemId: expId });
+    setDragCreate(null);
+    setResizeExp({ projectId, laneId, expId, edge, pointerId });
+  }
+
+  function updateResize(day: DayKey) {
+    setResizeExp((s) => {
+      if (!s) return s;
+      // apply patch immediately
+      if (s.edge === "start") updateExperimentRange(s.projectId, s.laneId, s.expId, { start: day });
+      else updateExperimentRange(s.projectId, s.laneId, s.expId, { end: day });
+      return s;
+    });
+  }
+
+  function finishResize(pointerId: number) {
+    setResizeExp((s) => (s && s.pointerId === pointerId ? null : s));
+  }
+
+  function addLane(projectId: string) {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const pIdx = next.findIndex((p) => p.id === projectId);
+      if (pIdx === -1) return prev;
+      next[pIdx].lanes.push({ id: `lane_${crypto.randomUUID()}`, items: [] });
+      return next;
+    });
+  }
+
+  function nextProjectColor(i: number) {
+    const palette = [
+      "#f59e0b", // amber
+      "#22c55e", // green
+      "#3b82f6", // blue
+      "#ef4444", // red
+      "#a855f7", // purple
+      "#14b8a6", // teal
+      "#f97316", // orange
+      "#84cc16", // lime
+    ];
+    return palette[i % palette.length];
+  }
+
+  function addProject() {
+    setProjects((prev) => {
+      const next = structuredClone(prev) as Project[];
+      const idx = next.length + 1;
+      const p: Project = {
+        id: `p_${crypto.randomUUID()}`,
+        name: `Project ${idx}`,
+        color: nextProjectColor(next.length),
+        lanes: [{ id: `lane_${crypto.randomUUID()}`, items: [] }],
+      };
+      next.push(p);
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (!selection) return;
+      if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        if (selection.kind === "item") deleteItem(selection.projectId, selection.itemId);
+        if (selection.kind === "subtask")
+          deleteExperimentSubTask(selection.projectId, selection.experimentId, selection.subTaskId);
+      }
+      if (e.key === "Escape") {
+        setSelection(null);
+        setResizeExp(null);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selection]);
+
+  // Esc also closes day agenda
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDayFocus(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Safety: end resize mode on pointerup/pointercancel anywhere (pointer capture prevents cell onPointerUp)
+  useEffect(() => {
+    if (!resizeExp) return;
+    const pid = resizeExp.pointerId;
+    const stop = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      setResizeExp(null);
+    };
+    window.addEventListener("pointerup", stop, true);
+    window.addEventListener("pointercancel", stop, true);
+    window.addEventListener("blur", () => setResizeExp(null));
+    return () => {
+      window.removeEventListener("pointerup", stop, true);
+      window.removeEventListener("pointercancel", stop, true);
+      window.removeEventListener("blur", () => setResizeExp(null));
+    };
+  }, [resizeExp]);
+
+  const dayAgenda = useMemo(() => {
+    if (!dayFocus) return [] as Array<{ project: Project; rows: Array<{ id: string; title: string; kind: "task" | "exp"; meta: any }> }>;
+    const out: Array<{ project: Project; rows: Array<{ id: string; title: string; kind: "task" | "exp"; meta: any }> }> = [];
+
+    for (const p of projects) {
+      const rows: Array<{ id: string; title: string; kind: "task" | "exp"; meta: any }> = [];
+
+      for (const lane of p.lanes) {
+        for (const it of lane.items) {
+          // standalone tasks
+          if (it.type === "task" && it.start === dayFocus) {
+            rows.push({
+              id: `t:${it.id}`,
+              title: it.title,
+              kind: "task",
+              meta: { projectId: p.id, itemId: it.id },
+            });
+          }
+
+          // experiment subtasks
+          if (it.type === "experiment") {
+            const tasks = it.subTasks?.[dayFocus] ?? [];
+            for (const st of tasks) {
+              rows.push({
+                id: `st:${it.id}:${st.id}`,
+                title: st.title,
+                kind: "exp",
+                meta: { projectId: p.id, experimentId: it.id, subTaskId: st.id },
+              });
+            }
+          }
+        }
+      }
+
+      if (rows.length) out.push({ project: p, rows });
+    }
+
+    return out;
+  }, [dayFocus, projects]);
+
+  const baseCellW = 112;
+  const cellW =
+    windowLen === 7
+      ? baseCellW * 2
+      : windowLen === 28
+      ? Math.floor((baseCellW * 14) / 28) // zmenšené tak, aby 4 týdny ≈ šířka 14 dní
+      : baseCellW;
+  const leftW = 0;
+
+  return (
+    <div
+      className="min-h-screen bg-zinc-50 p-6 text-zinc-900"
+      onClick={() => {
+        setSelection(null);
+        // safety: if we were resizing and user clicks elsewhere, exit resize mode
+        setResizeExp(null);
+      }}
+    >
+      <div className="mx-auto w-full">
+
+        <div className="flex items-start justify-between gap-4">
+          
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1 rounded-xl border border-zinc-200 bg-white p-1 shadow-sm">
+              <button
+                className={
+                  "rounded-lg px-3 py-1.5 text-sm " +
+                  (viewMode === "plan" ? "bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50")
+                }
+                onClick={() => setViewMode("plan")}
+                title="Plán (dny + řádky)"
+              >
+                Plán
+              </button>
+              <button
+                className={
+                  "rounded-lg px-3 py-1.5 text-sm " +
+                  (viewMode === "calendar" ? "bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50")
+                }
+                onClick={() => setViewMode("calendar")}
+                title="Kalendář (hodiny)"
+              >
+                Kalendář
+              </button>
+            </div>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => setWindowStart((d) => addDays(d, -windowLen))}
+            >
+              ◀︎ -{windowLen}
+            </button>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => setWindowStart((d) => addDays(d, -1))}
+            >
+              ◀︎ -1
+            </button>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => setWindowStart(() => addDays(todayUTC(), -2))}
+            >
+              Dnes
+            </button>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => setWindowStart((d) => addDays(d, 1))}
+            >
+              +1 ▶︎
+            </button>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => setWindowStart((d) => addDays(d, windowLen))}
+            >
+              +{windowLen} ▶︎
+            </button>
+            <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-white p-1 shadow-sm">
+              <button
+                className={
+                  "rounded-lg px-3 py-1.5 text-sm " +
+                  (windowLen === 7 ? "bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50")
+                }
+                onClick={() => setWindowLen(7)}
+                title="7denní okno"
+              >
+                7 dní
+              </button>
+              <button
+                className={
+                  "rounded-lg px-3 py-1.5 text-sm " +
+                  (windowLen === 14 ? "bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50")
+                }
+                onClick={() => setWindowLen(14)}
+                title="14denní okno"
+              >
+                14 dní
+              </button>
+              <button
+                className={
+                  "rounded-lg px-3 py-1.5 text-sm " +
+                  (windowLen === 28 ? "bg-zinc-900 text-white" : "bg-white hover:bg-zinc-50")
+                }
+                onClick={() => setWindowLen(28)}
+                title="4týdenní okno"
+              >
+                4 týdny
+              </button>
+            </div>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => addProject()}
+              title="Přidat nový projekt"
+            >
+              + projekt
+            </button>
+
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => exportJSON()}
+              title="Exportovat plán do JSON"
+            >
+              Export
+            </button>
+            <button
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm hover:bg-zinc-50"
+              onClick={() => fileInputRef.current?.click()}
+              title="Importovat plán z JSON"
+            >
+              Import
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) importJSON(f);
+                // allow re-importing same file
+                e.currentTarget.value = "";
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Content */}
+        {viewMode === "plan" ? (
+          <div className="mt-4">
+            <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-white shadow-sm">
+              <div className="min-w-max">
+                <div className="flex" style={{ width: days.length * cellW }}>
+                  {days.map((d) => {
+                    const { weekday, md } = dayLabel(d);
+                    const wk = weekday.toLowerCase();
+                    const isWeekend =
+                      wk.startsWith("sat") || wk.startsWith("sun") || wk.startsWith("so") || wk.startsWith("ne");
+                    return (
+                      <button
+                        key={d}
+                        className="border-b border-r border-zinc-200 px-2 py-2 text-center hover:bg-zinc-50"
+                        style={{ width: cellW }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDayFocus(d);
+                        }}
+                        title="Klik = seznam úkolů pro den"
+                      >
+                        <div className={"text-xs font-medium " + (isWeekend ? "text-red-600" : "text-zinc-700")}>{weekday}</div>
+                        <div className={"text-xs " + (isWeekend ? "text-red-500" : "text-zinc-500")}>{md}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <DndContext sensors={sensors} collisionDetection={collisionDetection} onDragEnd={onDragEnd}>
+                  <div>
+                    {projects.map((p) => (
+                      <div key={p.id} className="border-t border-zinc-200">
+                        <div className="flex items-center justify-end gap-2 px-2 py-2">
+                          <button
+                            className="rounded-lg border border-zinc-200 bg-white px-2 py-1 text-xs shadow-sm hover:bg-zinc-50"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              addLane(p.id);
+                            }}
+                            title="Přidat řádek"
+                          >
+                            + řádek
+                          </button>
+                        </div>
+                        <div className="pb-2">
+                          {p.lanes.map((lane) => (
+                            <LaneRow
+                              key={lane.id}
+                              project={p}
+                              lane={lane}
+                              days={days}
+                              leftW={leftW}
+                              dragCreate={dragCreate}
+                              resizeExp={resizeExp}
+                              onStartRange={(day, pointerId) => startRange(p.id, lane.id, day, pointerId)}
+                              onUpdateRange={(day) => updateRange(day)}
+                              onFinishRange={(pointerId, clickedDay, clickedExperimentId) =>
+                                finishRange(pointerId, clickedDay, clickedExperimentId)
+                              }
+                              onStartResize={(expId, edge, pointerId) => startResize(p.id, lane.id, expId, edge, pointerId)}
+                              onUpdateResize={(day) => updateResize(day)}
+                              onFinishResize={(pointerId) => finishResize(pointerId)}
+                              selection={selection}
+                              onSelectItem={(projectId, itemId) => setSelection({ kind: "item", projectId, itemId })}
+                              onDeleteItem={(projectId, itemId) => deleteItem(projectId, itemId)}
+                              onUpdateTitle={(projectId, itemId, title) => updateItemTitle(projectId, itemId, title)}
+                              onAddSubTask={(experimentId, day) => addExperimentSubTask(p.id, lane.id, experimentId, day)}
+                              onSelectSubTask={(experimentId, subTaskId) =>
+                                setSelection({ kind: "subtask", projectId: p.id, experimentId, subTaskId })
+                              }
+                              onUpdateSubTaskTitle={(experimentId, subTaskId, title) =>
+                                updateExperimentSubTaskTitle(p.id, experimentId, subTaskId, title)
+                              }
+                              onDeleteSubTask={(experimentId, subTaskId) => deleteExperimentSubTask(p.id, experimentId, subTaskId)}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </DndContext>
+              </div>
+            </div>
+
+            {dayFocus && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setDayFocus(null)}>
+                <div className="w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+                  <div className="flex items-start justify-between">
+                    <div className="text-sm font-semibold">Úkoly pro {dayLabel(dayFocus).weekday} {dayLabel(dayFocus).md}</div>
+                    <button
+                      className="h-8 w-8 rounded-full border border-zinc-200 bg-white shadow-sm hover:bg-zinc-50"
+                      onClick={() => setDayFocus(null)}
+                      title="Zavřít"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {dayAgenda.length === 0 ? (
+                      <div className="text-sm text-zinc-600">Žádné úkoly.</div>
+                    ) : (
+                      dayAgenda.flatMap(({ project, rows }) =>
+                        rows.map((r) => (
+                          <button
+                            key={project.id + ":" + r.id}
+                            className="flex w-full items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-left hover:bg-zinc-50"
+                            onClick={() => {
+                              setDayFocus(null);
+                              if (r.meta?.itemId) setSelection({ kind: "item", projectId: project.id, itemId: r.meta.itemId });
+                              if (r.meta?.subTaskId)
+                                setSelection({ kind: "subtask", projectId: project.id, experimentId: r.meta.experimentId, subTaskId: r.meta.subTaskId });
+                            }}
+                          >
+                            <span className="h-3 w-3 rounded-full" style={{ background: project.color }} />
+                            <span className="text-sm font-medium">{r.title}</span>
+                          </button>
+                        ))
+                      )
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <CalendarView
+            days={calDays}
+            inbox={inboxTasks}
+            catalog={taskCatalog}
+            events={eventsForCal}
+            recurring={recurring}
+            onCreateEvent={(taskId, day) => {
+              setTimedEvents((prev) => {
+                if (prev[taskId]) return prev;
+                return { ...prev, [taskId]: { id: taskId, day, startMin: 9 * 60, endMin: 10 * 60 } };
+              });
+            }}
+            onMoveEvent={(id, patch) => {
+              setTimedEvents((prev) => {
+                const ex = prev[id];
+                if (!ex) return prev;
+                return { ...prev, [id]: { ...ex, ...patch } };
+              });
+            }}
+            onDeleteEvent={(id) => {
+              setTimedEvents((prev) => {
+                const next = { ...prev };
+                delete next[id];
+                return next;
+              });
+            }}
+            onAddRecurring={(r) => setRecurring((prev) => [...prev, r])}
+            onDeleteRecurring={(rid) => setRecurring((prev) => prev.filter((x) => x.id !== rid))}
+            onUpdateRecurring={(rid, patch) =>
+              setRecurring((prev) => prev.map((r) => (r.id === rid ? { ...r, ...patch } : r)))
+            }
+            recurringModal={recurringModal}
+            setRecurringModal={setRecurringModal}
+            calendarDaysLen={calendarDaysLen}
+            setCalendarDaysLen={setCalendarDaysLen}
+            sensors={sensors}
+            resizeEvt={resizeEvt}
+            setResizeEvt={setResizeEvt}
+          />
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+function CalendarView({
+  days,
+  inbox,
+  catalog,
+  events,
+  recurring,
+  onCreateEvent,
+  onMoveEvent,
+  onDeleteEvent,
+  onAddRecurring,
+  onDeleteRecurring,
+  onUpdateRecurring,
+  recurringModal,
+  setRecurringModal,
+  calendarDaysLen,
+  setCalendarDaysLen,
+  sensors,
+  resizeEvt,
+  setResizeEvt,
+}: {
+  days: DayKey[];
+  inbox: TaskRef[];
+  catalog: TaskRef[];
+  events: TimedEvent[];
+  recurring: RecurringEvent[];
+  onCreateEvent: (taskId: string, day: DayKey) => void;
+  onMoveEvent: (id: string, patch: Partial<TimedEvent>) => void;
+  onDeleteEvent: (id: string) => void;
+  onAddRecurring: (r: RecurringEvent) => void;
+  onDeleteRecurring: (rid: string) => void;
+  onUpdateRecurring: (rid: string, patch: Partial<RecurringEvent>) => void;
+  recurringModal: boolean;
+  setRecurringModal: React.Dispatch<React.SetStateAction<boolean>>;
+  calendarDaysLen: 3 | 5 | 7;
+  setCalendarDaysLen: React.Dispatch<React.SetStateAction<3 | 5 | 7>>;
+  sensors: any;
+  resizeEvt: { id: string; pointerId: number } | null;
+  setResizeEvt: React.Dispatch<React.SetStateAction<{ id: string; pointerId: number } | null>>;
+}) {
+  const startHour = 6;
+  const endHour = 24;
+  const hourH = 44;
+  const dayW = 180;
+  const gridRef = useRef<HTMLDivElement | null>(null);
+
+  const [editingRecId, setEditingRecId] = useState<string | null>(null);
+  const [recForm, setRecForm] = useState<{ title: string; weekday: number; color: string; from: string; to: string }>(() => ({
+    title: "",
+    weekday: 1,
+    color: "#0ea5e9",
+    from: "09:00",
+    to: "10:00",
+  }));
+
+  const minToHHMM = (m: number) => {
+    const h = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    return `${h}:${mm}`;
+  };
+  const hhmmToMin = (s: string) => {
+    const [h, mm] = s.split(":").map(Number);
+    return h * 60 + mm;
+  };
+
+  const openNewRecurring = () => {
+    setEditingRecId(null);
+    setRecForm({ title: "", weekday: 1, color: "#0ea5e9", from: "09:00", to: "10:00" });
+    setRecurringModal(true);
+  };
+
+  const openEditRecurring = (rid: string) => {
+    const r = recurring.find((x) => x.id === rid);
+    if (!r) return;
+    setEditingRecId(rid);
+    setRecForm({
+      title: r.title,
+      weekday: r.weekday,
+      color: r.color,
+      from: minToHHMM(r.startMin),
+      to: minToHHMM(r.endMin),
+    });
+    setRecurringModal(true);
+  };
+
+  const byId = useMemo(() => {
+    const m = new Map<string, TaskRef>();
+    for (const t of catalog) m.set(t.id, t);
+    // also include already scheduled tasks so event pills can show titles/colors
+    // (they may have been removed from inbox)
+    return m;
+  }, [catalog]);
+
+  const allTaskLookup = (id: string): TaskRef | null => {
+    // inbox has only unscheduled; try reconstruct minimal from id by storing title in DOM title fallback
+    const t = byId.get(id);
+    return t ?? null;
+  };
+
+  // Droppables: one per day column
+  function DayDrop({ day }: { day: DayKey }) {
+    const { setNodeRef, isOver } = useDroppable({ id: `daycol:${day}` });
+    return (
+      <div
+        ref={setNodeRef}
+        className={"absolute inset-y-0 " + (isOver ? "bg-zinc-50" : "")}
+        style={{ left: 56 + days.indexOf(day) * dayW, width: dayW }}
+      />
+    );
+  }
+
+  function EventBox({ ev }: { ev: TimedEvent | (TimedEvent & { isRecurring: true; recurringId: string; color: string; title: string }) }) {
+    const isRec = (ev as any).isRecurring;
+    const task = isRec ? null : allTaskLookup(ev.id);
+    const title = isRec ? (ev as any).title : (task?.title ?? ev.id);
+    const color = isRec ? (ev as any).color : (task?.color ?? "#64748b");
+
+    const dayIdx = days.indexOf(ev.day);
+    if (dayIdx < 0) return null;
+
+    const top = (ev.startMin / 60 - startHour) * hourH;
+    const height = Math.max(18, ((ev.endMin - ev.startMin) / 60) * hourH);
+    const left = 56 + dayIdx * dayW + 6;
+    const width = dayW - 12;
+
+    // Use dnd-kit directly here so we can exclude the resize handle from drag listeners.
+   const draggable = useDraggable({ id: `calevt:${ev.id}`, disabled: isRec });
+
+
+    const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } = draggable;
+
+    const dragStyle: React.CSSProperties = transform
+      ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` }
+      : undefined;
+
+    return (
+      <div
+        ref={setNodeRef}
+        className={"absolute pointer-events-auto " + (isDragging ? "opacity-60" : "")}
+        style={{ left, top: 44 + top, width, height, ...dragStyle, touchAction: "none" }}
+      >
+        <div
+          ref={setActivatorNodeRef}
+          {...(isRec ? {} : attributes)}
+          {...(isRec ? {} : listeners)}
+          className={
+            "relative h-full rounded-lg px-2 py-1 text-xs font-semibold text-white shadow-sm " +
+            (isRec ? "cursor-default" : "cursor-grab active:cursor-grabbing")
+          }
+          style={{ background: color }}
+          title={title}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isRec) openEditRecurring((ev as any).recurringId);
+          }}
+        >
+          <div className="truncate pr-6">{title}</div>
+          <button
+            className="absolute right-1 top-1 h-5 w-5 rounded bg-white/20 text-[10px] hover:bg-white/30"
+            onClick={(e) => {
+              e.stopPropagation();
+              isRec ? onDeleteRecurring((ev as any).recurringId) : onDeleteEvent(ev.id);
+            }}
+            title="Smazat časování"
+          >
+            ✕
+          </button>
+
+          {!isRec && (
+            <div
+              className="absolute bottom-0 left-0 right-0 h-3 cursor-ns-resize"
+              title="Změnit konec"
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                if (e.button !== 0) return;
+                (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                setResizeEvt({ id: ev.id, pointerId: e.pointerId });
+              }}
+            />
+          )}
+
+          {isRec && (
+            <button
+              className="absolute bottom-1 right-2 rounded bg-white/20 px-1 text-[10px] font-semibold text-white/90 hover:bg-white/30"
+              title="Upravit opakování"
+              onClick={(e) => {
+                e.stopPropagation();
+                openEditRecurring((ev as any).recurringId);
+              }}
+            >
+              ↻
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // resize behavior (end time)
+  useEffect(() => {
+    if (!resizeEvt) return;
+    const pid = resizeEvt.pointerId;
+    const move = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      const rect = gridRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const y = e.clientY - rect.top - 44;
+      const minutesFromStart = Math.max(0, Math.min((endHour - startHour) * 60, Math.round((y / hourH) * 60 / 15) * 15));
+      const ev = events.find((x) => x.id === resizeEvt.id);
+      if (!ev) return;
+      const endMin = Math.max(ev.startMin + 15, startHour * 60 + minutesFromStart);
+      onMoveEvent(ev.id, { endMin: Math.min(endHour * 60, endMin) });
+    };
+    const stop = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      setResizeEvt(null);
+    };
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", stop, true);
+    window.addEventListener("pointercancel", stop, true);
+    return () => {
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", stop, true);
+      window.removeEventListener("pointercancel", stop, true);
+    };
+  }, [resizeEvt, events]);
+
+  const collisionDetection = (args: any) => {
+    const within = pointerWithin(args);
+    return within.length ? within : closestCenter(args);
+  };
+
+  function onCalDragEnd(ev: DragEndEvent) {
+    const activeId = String(ev.active.id);
+    const overId = ev.over ? String(ev.over.id) : null;
+
+    // 1) Inbox -> day column (create timed event)
+    if (activeId.startsWith("inbox:") && overId && overId.startsWith("daycol:")) {
+      const taskId = activeId.slice("inbox:".length);
+      const day = overId.slice("daycol:".length) as DayKey;
+      onCreateEvent(taskId, day);
+      return;
+    }
+
+    // 2) Moving existing calendar event
+    if (activeId.startsWith("calevt:")) {
+      const id = activeId.slice("calevt:".length);
+      const existing = events.find((e) => e.id === id);
+      if (!existing) return;
+
+      // --- vertical move (change start time) ---
+      const deltaY = (ev.delta?.y ?? 0);
+      const minutesDelta = Math.round((deltaY / hourH) * 60 / 15) * 15;
+      let newStart = existing.startMin + minutesDelta;
+      newStart = Math.max(startHour * 60, Math.min(endHour * 60 - 15, newStart));
+      let newEnd = newStart + (existing.endMin - existing.startMin);
+      if (newEnd > endHour * 60) {
+        newEnd = endHour * 60;
+        newStart = newEnd - (existing.endMin - existing.startMin);
+      }
+
+      const patch: Partial<TimedEvent> = {
+        startMin: newStart,
+        endMin: newEnd,
+      };
+
+      // --- horizontal move (change day) ---
+      if (overId && overId.startsWith("daycol:")) {
+        const day = overId.slice("daycol:".length) as DayKey;
+        patch.day = day;
+      }
+
+      onMoveEvent(id, patch);
+      return;
+    }
+  }
+
+  const inboxByDay = useMemo(() => {
+    const m: Record<string, TaskRef[]> = {};
+    for (const d of days) m[d] = [];
+    for (const t of inbox) {
+      if (!m[t.day]) m[t.day] = [];
+      m[t.day].push(t);
+    }
+    // stable order (by title)
+    for (const d of Object.keys(m)) {
+      m[d] = m[d].slice().sort((a, b) => a.title.localeCompare(b.title));
+    }
+    return m;
+  }, [inbox, days]);
+
+  const recurringInstances = useMemo(() => {
+    const out: Array<TimedEvent & { recurringId: string; isRecurring: true; color: string; title: string }> = [];
+    for (const r of recurring) {
+      for (const day of days) {
+        const dt = parseDay(day);
+        if (dt.getUTCDay() !== r.weekday) continue;
+        out.push({
+          id: `rec:${r.id}:${day}`,
+          day,
+          startMin: r.startMin,
+          endMin: r.endMin,
+          recurringId: r.id,
+          isRecurring: true,
+          color: r.color,
+          title: r.title,
+        });
+      }
+    }
+    return out;
+  }, [recurring, days]);
+
+  const hours = Array.from({ length: endHour - startHour + 1 }, (_, i) => startHour + i);
+
+  return (
+    <div className="mt-6 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="text-sm font-semibold text-zinc-900">Kalendář</div>
+          <button
+            className="rounded-lg border border-zinc-200 bg-white px-2 py-1 text-xs shadow-sm hover:bg-zinc-50"
+            onClick={() => openNewRecurring()}
+            title="Přidat opakovaný blok"
+          >
+            + opakování
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="text-xs text-zinc-600">Dny:</div>
+          <div className="flex items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1">
+            <button
+              className={
+                "rounded-md px-2 py-1 text-xs " +
+                (calendarDaysLen === 3 ? "bg-zinc-900 text-white" : "hover:bg-zinc-50")
+              }
+              onClick={() => setCalendarDaysLen(3)}
+            >
+              3
+            </button>
+            <button
+              className={
+                "rounded-md px-2 py-1 text-xs " +
+                (calendarDaysLen === 5 ? "bg-zinc-900 text-white" : "hover:bg-zinc-50")
+              }
+              onClick={() => setCalendarDaysLen(5)}
+            >
+              5
+            </button>
+            <button
+              className={
+                "rounded-md px-2 py-1 text-xs " +
+                (calendarDaysLen === 7 ? "bg-zinc-900 text-white" : "hover:bg-zinc-50")
+              }
+              onClick={() => setCalendarDaysLen(7)}
+            >
+              7
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <DndContext sensors={sensors} collisionDetection={collisionDetection} onDragEnd={onCalDragEnd}>
+        <div className="mt-4 overflow-x-auto">
+          <div style={{ width: 56 + days.length * dayW }}>
+            {/* Per-day inbox row */}
+            <div className="flex">
+              <div className="w-[56px]" />
+              {days.map((d) => (
+                <div key={d} className="border border-zinc-200 bg-zinc-50" style={{ width: dayW }}>
+                  <div className="px-2 py-1">
+                    <div className="flex flex-wrap gap-1">
+                      {(inboxByDay[d] ?? []).length === 0 ? (
+                        <span className="text-[11px] text-zinc-500">&nbsp;</span>
+                      ) : (
+                        (inboxByDay[d] ?? []).map((t) => (
+                          <Draggable key={t.id} id={`inbox:${t.id}`}>
+                            <div
+                              className="cursor-grab active:cursor-grabbing rounded-md px-2 py-0.5 text-[11px] font-semibold text-white shadow-sm"
+                              style={{ background: t.color }}
+                              title={t.title}
+                            >
+                              <div className="truncate max-w-[150px]">{t.title}</div>
+                            </div>
+                          </Draggable>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Calendar grid */}
+            <div
+              ref={gridRef}
+              className="relative"
+              style={{ width: 56 + days.length * dayW, height: 44 + (endHour - startHour) * hourH }}
+            >
+              {/* Header */}
+              <div className="absolute left-0 top-0 flex" style={{ height: 44, width: 56 + days.length * dayW }}>
+                <div className="w-[56px] border border-zinc-200 bg-white" />
+                {days.map((d) => {
+                  const { weekday, md } = dayLabel(d);
+                  const wk = weekday.toLowerCase();
+                  const isWeekend =
+                    wk.startsWith("sat") || wk.startsWith("sun") || wk.startsWith("so") || wk.startsWith("ne");
+                  return (
+                    <div key={d} className="border border-zinc-200 bg-white px-2 py-2 text-center" style={{ width: dayW }}>
+                      <div className={"text-xs font-medium " + (isWeekend ? "text-red-600" : "text-zinc-700")}>{weekday}</div>
+                      <div className={"text-xs " + (isWeekend ? "text-red-500" : "text-zinc-500")}>{md}</div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Droppable day columns */}
+              {days.map((d) => (
+                <DayDrop key={d} day={d} />
+              ))}
+
+              {/* Hour lines + labels */}
+              {hours.map((h, idx) => {
+                if (h === endHour) return null;
+                const top = 44 + idx * hourH;
+                return (
+                  <React.Fragment key={h}>
+                    <div
+                      className="absolute left-0 border-t border-zinc-200 text-[11px] text-zinc-600"
+                      style={{ top, width: 56, height: 0 }}
+                    />
+                    <div className="absolute left-0 px-2 text-[11px] text-zinc-600" style={{ top: top + 2, width: 56 }}>
+                      {String(h).padStart(2, "0")}:00
+                    </div>
+                    <div className="absolute left-[56px] border-t border-zinc-200" style={{ top, width: days.length * dayW }} />
+                  </React.Fragment>
+                );
+              })}
+
+              {/* Day separators */}
+              {days.map((_, i) => (
+                <div
+                  key={i}
+                  className="absolute top-[44px] bottom-0 border-l border-zinc-200"
+                  style={{ left: 56 + i * dayW }}
+                />
+              ))}
+
+              {/* Events */}
+              {[...recurringInstances, ...events].map((ev) => (
+                <EventBox key={ev.id} ev={ev as any} />
+              ))}
+            </div>
+          </div>
+        </div>
+      </DndContext>
+
+      {recurringModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4"
+          onClick={() => setRecurringModal(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between">
+              <div className="text-sm font-semibold">{editingRecId ? "Upravit opakování" : "Nové opakování"}</div>
+              <button
+                className="h-8 w-8 rounded-full border border-zinc-200 bg-white shadow-sm hover:bg-zinc-50"
+                onClick={() => setRecurringModal(false)}
+                title="Zavřít"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-3 space-y-3">
+              <div>
+                <div className="mb-1 text-xs text-zinc-600">Název</div>
+                <input
+                  className="h-9 w-full rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
+                  placeholder="např. meeting / seminář"
+                  value={recForm.title}
+                  onChange={(e) => setRecForm((p) => ({ ...p, title: e.target.value }))}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="mb-1 text-xs text-zinc-600">Den v týdnu</div>
+                  <select
+                    className="h-9 w-full rounded-lg border border-zinc-200 px-3 text-sm"
+                    value={recForm.weekday}
+                    onChange={(e) => setRecForm((p) => ({ ...p, weekday: Number(e.target.value) }))}
+                  >
+                    <option value={1}>Po</option>
+                    <option value={2}>Út</option>
+                    <option value={3}>St</option>
+                    <option value={4}>Čt</option>
+                    <option value={5}>Pá</option>
+                    <option value={6}>So</option>
+                    <option value={0}>Ne</option>
+                  </select>
+                </div>
+                <div>
+                  <div className="mb-1 text-xs text-zinc-600">Barva</div>
+                  <input
+                    type="color"
+                    className="h-9 w-full rounded-lg border border-zinc-200 px-2"
+                    value={recForm.color}
+                    onChange={(e) => setRecForm((p) => ({ ...p, color: e.target.value }))}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="mb-1 text-xs text-zinc-600">Od</div>
+                  <input
+                    type="time"
+                    className="h-9 w-full rounded-lg border border-zinc-200 px-3 text-sm"
+                    value={recForm.from}
+                    onChange={(e) => setRecForm((p) => ({ ...p, from: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <div className="mb-1 text-xs text-zinc-600">Do</div>
+                  <input
+                    type="time"
+                    className="h-9 w-full rounded-lg border border-zinc-200 px-3 text-sm"
+                    value={recForm.to}
+                    onChange={(e) => setRecForm((p) => ({ ...p, to: e.target.value }))}
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  className="h-9 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+                  onClick={() => setRecurringModal(false)}
+                >
+                  Zrušit
+                </button>
+
+                <div className="flex items-center gap-2">
+                  {editingRecId && (
+                    <button
+                      className="h-9 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+                      onClick={() => {
+                        onDeleteRecurring(editingRecId);
+                        setRecurringModal(false);
+                      }}
+                      title="Smazat celé opakování"
+                    >
+                      Smazat
+                    </button>
+                  )}
+
+                  <button
+                    className="h-9 rounded-lg bg-zinc-900 px-3 text-sm font-semibold text-white hover:bg-zinc-800"
+                    onClick={() => {
+                      const title = recForm.title.trim();
+                      if (!title) return;
+                      const startMin = hhmmToMin(recForm.from);
+                      const endMin = Math.max(startMin + 15, hhmmToMin(recForm.to));
+
+                      if (editingRecId) {
+                        onUpdateRecurring(editingRecId, {
+                          title,
+                          weekday: recForm.weekday,
+                          color: recForm.color,
+                          startMin,
+                          endMin,
+                        });
+                      } else {
+                        onAddRecurring({
+                          id: crypto.randomUUID(),
+                          title,
+                          weekday: recForm.weekday,
+                          color: recForm.color,
+                          startMin,
+                          endMin,
+                        });
+                      }
+                      setRecurringModal(false);
+                    }}
+                  >
+                    Uložit
+                  </button>
+                </div>
+              </div>
+
+              <div className="text-[11px] text-zinc-600">
+                Opakování je samostatný blok. Klikni na blok nebo ↻ pro úpravu.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+
+function LaneRow({
+  project,
+  lane,
+  days,
+  leftW: _leftW,
+  dragCreate,
+  resizeExp,
+  onStartRange,
+  onUpdateRange,
+  onFinishRange,
+  onStartResize,
+  onUpdateResize,
+  onFinishResize,
+  selection,
+  onSelectItem,
+  onDeleteItem,
+  onUpdateTitle,
+  onAddSubTask,
+  onSelectSubTask,
+  onUpdateSubTaskTitle,
+  onDeleteSubTask,
+}: {
+  project: Project;
+  lane: Lane;
+  days: DayKey[];
+  leftW: number;
+  dragCreate: DragCreate;
+  resizeExp: ResizeExp;
+  onStartRange: (day: DayKey, pointerId: number) => void;
+  onUpdateRange: (day: DayKey) => void;
+  onFinishRange: (pointerId: number, clickedDay: DayKey, clickedExperimentId: string | null) => void;
+  onStartResize: (expId: string, edge: "start" | "end", pointerId: number) => void;
+  onUpdateResize: (day: DayKey) => void;
+  onFinishResize: (pointerId: number) => void;
+  selection: Selection;
+  onSelectItem: (projectId: string, itemId: string) => void;
+  onDeleteItem: (projectId: string, itemId: string) => void;
+  onUpdateTitle: (projectId: string, itemId: string, title: string) => void;
+  onAddSubTask: (experimentId: string, day: DayKey) => void;
+  onSelectSubTask: (experimentId: string, subTaskId: string) => void;
+  onUpdateSubTaskTitle: (experimentId: string, subTaskId: string, title: string) => void;
+  onDeleteSubTask: (experimentId: string, subTaskId: string) => void;
+}) {
+  const cellW =
+    days.length === 7
+      ? 224
+      : days.length === 28
+      ? Math.floor((112 * 14) / 28)
+      : 112;
+  const gridRef = useRef<HTMLDivElement | null>(null);
+
+  const itemsInWindow = lane.items.filter(
+    (it) => !(compareDay(it.end, days[0]) < 0 || compareDay(days[days.length - 1], it.start) < 0)
+  );
+
+  // Resize experiment: listen globally for pointermove/up because resize handle uses pointer capture
+  useEffect(() => {
+    if (!resizeExp) return;
+    if (resizeExp.projectId !== project.id || resizeExp.laneId !== lane.id) return;
+
+    const pid = resizeExp.pointerId;
+
+    const move = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      const rect = gridRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const x = e.clientX - rect.left;
+      const idx = Math.max(0, Math.min(days.length - 1, Math.floor(x / cellW)));
+      onUpdateResize(days[idx]);
+    };
+
+    const stop = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      onFinishResize(pid);
+    };
+
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", stop, true);
+    window.addEventListener("pointercancel", stop, true);
+    return () => {
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", stop, true);
+      window.removeEventListener("pointercancel", stop, true);
+    };
+  }, [resizeExp, project.id, lane.id, days]);
+
+  return (
+    <div className="flex">
+      <div ref={gridRef} className="relative flex" style={{ width: days.length * cellW, height: 80 }}>
+        {/* Cells */}
+        <div className="absolute inset-0 flex">
+          {days.map((d) => (
+            <DroppableCell
+              key={d}
+              width={cellW}
+              id={`cell:${project.id}:${lane.id}:${d}`}
+              onPointerDown={(e) => {
+                // pokud klik přišel z překryvu (např. expday zóna), ignoruj
+                if (e.target !== e.currentTarget) return;
+                if (e.button !== 0) return;
+                if (resizeExp) return;
+                (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                onStartRange(d, e.pointerId);
+              }}
+              onPointerMove={(e) => {
+                if (!dragCreate) return;
+                if (dragCreate.projectId !== project.id || dragCreate.laneId !== lane.id) return;
+                if (dragCreate.pointerId !== e.pointerId) return;
+                const rect = gridRef.current?.getBoundingClientRect();
+                if (!rect) return;
+                const x = e.clientX - rect.left;
+                const idx = Math.max(0, Math.min(days.length - 1, Math.floor(x / cellW)));
+                const day = days[idx];
+                if (day !== dragCreate.currentDay) onUpdateRange(day);
+              }}
+              onPointerUp={(e) => {
+                // pokud klik přišel z překryvu, ignoruj
+                if (e.target !== e.currentTarget) {
+                  try {
+                    (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                  } catch {}
+                  return;
+                }
+
+                // důležité: u myši je pointerId často pořád stejné (typicky 1), takže MUSÍME uvolnit capture,
+                // jinak bude buňka dál chytat události a vznikají duplicitní tasky v jiných řádcích.
+                try {
+                  (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                } catch {}
+
+                if (resizeExp && resizeExp.projectId === project.id && resizeExp.laneId === lane.id && resizeExp.pointerId === e.pointerId) {
+                  onFinishResize(e.pointerId);
+                  return;
+                }
+                if (!dragCreate) return;
+                if (dragCreate.projectId !== project.id || dragCreate.laneId !== lane.id) return;
+                onFinishRange(
+                  e.pointerId,
+                  d,
+                  (() => {
+                    const exp = findExperimentAtDay(lane, d);
+                    return exp && exp.type === "experiment" ? exp.id : null;
+                  })()
+                );
+              }}
+            />
+          ))}
+        </div>
+
+        {/* Range-create preview */}
+        {dragCreate &&
+          dragCreate.projectId === project.id &&
+          dragCreate.laneId === lane.id &&
+          (() => {
+            const s = compareDay(dragCreate.startDay, dragCreate.currentDay) <= 0 ? dragCreate.startDay : dragCreate.currentDay;
+            const e = compareDay(dragCreate.startDay, dragCreate.currentDay) <= 0 ? dragCreate.currentDay : dragCreate.startDay;
+            const visStart = compareDay(s, days[0]) < 0 ? days[0] : s;
+            const visEnd = compareDay(e, days[days.length - 1]) > 0 ? days[days.length - 1] : e;
+            const left = diffDays(days[0], visStart) * cellW + 4;
+            const span = diffDays(visStart, visEnd) + 1;
+            const width = span * cellW - 8;
+            return (
+              <div className="pointer-events-none absolute" style={{ left, width, top: 4, height: 72 }}>
+                <div className="h-full rounded-md border-2 border-zinc-400 bg-transparent" />
+              </div>
+            );
+          })()}
+
+        {/* Segments + experiment subtasks */}
+        <div className="pointer-events-none absolute inset-0">
+          {itemsInWindow.map((it) => {
+            const visStart = compareDay(it.start, days[0]) < 0 ? days[0] : it.start;
+            const visEnd = compareDay(it.end, days[days.length - 1]) > 0 ? days[days.length - 1] : it.end;
+
+            const left = diffDays(days[0], visStart) * cellW + 4;
+            const span = diffDays(visStart, visEnd) + 1;
+            const width = span * cellW - 8;
+
+            return (
+              <div key={it.id} className="absolute" style={{ left, width, top: 4, height: 72 }}>
+                <div className="pointer-events-auto h-full">
+                  <Draggable id={`item:${project.id}:${lane.id}:${it.id}`} className={it.type === "experiment" ? "h-full" : ""}>
+                    <div className="cursor-grab active:cursor-grabbing h-full">
+                      <Segment
+                        item={it}
+                        color={project.color}
+                        selected={
+                          !!selection &&
+                          selection.kind === "item" &&
+                          selection.projectId === project.id &&
+                          selection.itemId === it.id
+                        }
+                        onSelect={() => onSelectItem(project.id, it.id)}
+                        onDelete={() => onDeleteItem(project.id, it.id)}
+                        onUpdateTitle={(title) => onUpdateTitle(project.id, it.id, title)}
+                      />
+
+                      {/* Resize handles for experiments */}
+                      {it.type === "experiment" && (
+                        <>
+                          <div
+                            className="absolute left-0 top-0 z-20 h-full w-3 cursor-ew-resize"
+                            title="Změnit začátek experimentu"
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              if (e.button !== 0) return;
+                              onStartResize(it.id, "start", e.pointerId);
+                            }}
+                            onPointerUp={(e) => {
+                              e.stopPropagation();
+                              onFinishResize(e.pointerId);
+                            }}
+                            onPointerCancel={(e) => {
+                              e.stopPropagation();
+                              onFinishResize(e.pointerId);
+                            }}
+                          />
+                          <div
+                            className="absolute right-0 top-0 z-20 h-full w-3 cursor-ew-resize"
+                            title="Změnit konec experimentu"
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              if (e.button !== 0) return;
+                              (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                              onStartResize(it.id, "end", e.pointerId);
+                            }}
+                            onPointerUp={(e) => {
+                              e.stopPropagation();
+                              try {
+                                (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                              } catch {}
+                              onFinishResize(e.pointerId);
+                            }}
+                            onPointerCancel={(e) => {
+                              e.stopPropagation();
+                              try {
+                                (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                              } catch {}
+                              onFinishResize(e.pointerId);
+                            }}
+                          />
+                        </>
+                      )}
+                    </div>
+                  </Draggable>
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Click-zóny (droppable + click) pro práci uvnitř experimentu */}
+          {itemsInWindow
+            .filter((it) => it.type === "experiment")
+            .flatMap((it) => {
+              const exp = it as Extract<LaneItem, { type: "experiment" }>;
+              const nodes: React.ReactNode[] = [];
+              for (const day of days) {
+                if (compareDay(day, exp.start) < 0 || compareDay(day, exp.end) > 0) continue;
+                const x = diffDays(days[0], day) * cellW + 8;
+                nodes.push(
+                  <ExpDayDroppable
+                    key={`expday:${exp.id}:${day}`}
+                    id={`expday:${project.id}:${lane.id}:${exp.id}:${day}`}
+                    title="Klik: přidat task do experimentu / nebo sem přetáhni pill"
+                    style={{ left: x, top: 52, width: cellW - 16, height: 20 }}
+                    onPointerDown={(e) => {
+                      // zabráníme tomu, aby klik uvnitř experimentu spustil i onPointerDown na buňce pod tím
+                      e.stopPropagation();
+                    }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAddSubTask(exp.id, day);
+                    }}
+                  />
+                );
+              }
+              return nodes;
+            })}
+
+          {/* Render experiment subtasks as per-day stacks */}
+          {itemsInWindow
+            .filter((it) => it.type === "experiment")
+            .flatMap((it) => {
+              const exp = it as Extract<LaneItem, { type: "experiment" }>;
+              const out: React.ReactNode[] = [];
+
+              for (const [day, tasks] of Object.entries(exp.subTasks)) {
+                if (compareDay(day, days[0]) < 0 || compareDay(day, days[days.length - 1]) > 0) continue;
+                if (compareDay(day, exp.start) < 0 || compareDay(day, exp.end) > 0) continue;
+
+                const x = diffDays(days[0], day) * cellW + 8;
+                const maxShow = 2;
+                const shown = tasks.slice(0, maxShow);
+                const hidden = tasks.length - shown.length;
+
+                out.push(
+                  <div key={`${exp.id}:${day}`} className="pointer-events-auto absolute" style={{ left: x, top: 8, width: cellW - 16 }}>
+                    <div className="space-y-1">
+                      {shown.map((t) => (
+                        <Draggable id={`subtask:${project.id}:${lane.id}:${exp.id}:${t.id}`} key={t.id}>
+                          <div className="cursor-grab active:cursor-grabbing">
+                            <SubTaskPill
+                              text={t.title}
+                              color={project.color}
+                              selected={
+                                !!selection &&
+                                selection.kind === "subtask" &&
+                                selection.projectId === project.id &&
+                                selection.experimentId === exp.id &&
+                                selection.subTaskId === t.id
+                              }
+                              onSelect={() => onSelectSubTask(exp.id, t.id)}
+                              onUpdateTitle={(title) => onUpdateSubTaskTitle(exp.id, t.id, title)}
+                              onDelete={() => onDeleteSubTask(exp.id, t.id)}
+                            />
+                          </div>
+                        </Draggable>
+                      ))}
+                      {hidden > 0 && (
+                        <div className="text-[10px] font-medium text-zinc-700">+{hidden}…</div>
+                      )}
+                    </div>
+                  </div>
+                );
+              }
+              return out;
+            })}
+        </div>
+      </div>
+    </div>
+  );
+}
