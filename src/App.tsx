@@ -1280,6 +1280,25 @@ function LaneRow({
 // AgendaView component
 // ---------------------------------------------
 
+function AgendaDayDrop({ day, children, darkMode }: { day: DayKey; children: React.ReactNode; darkMode?: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({ id: `agenda-day:${day}` });
+  return (
+    <div ref={setNodeRef} className="flex-1 px-4 py-3" style={{ background: isOver ? (darkMode ? 'rgba(56,100,180,0.15)' : 'rgba(219,234,254,0.5)') : undefined, minHeight: 40, borderRadius: isOver ? 8 : 0, transition: 'background 0.15s' }}>
+      {children}
+    </div>
+  );
+}
+
+function AgendaDraggable({ id, children }: { id: string; children: React.ReactNode }) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: `agenda-item:${id}` });
+  const style: React.CSSProperties = transform ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`, opacity: isDragging ? 0.5 : 1, zIndex: isDragging ? 50 : undefined } : {};
+  return (
+    <div ref={setNodeRef} {...attributes} {...listeners} style={{ ...style, touchAction: 'none' }}>
+      {children}
+    </div>
+  );
+}
+
 function AgendaView({
   days,
   projects,
@@ -1288,6 +1307,8 @@ function AgendaView({
   completedTasks = {},
   onToggleComplete,
   onOpenDetail,
+  onMoveTaskToDay,
+  onUpdateTitle,
 }: {
   days: DayKey[];
   projects: Project[];
@@ -1296,8 +1317,13 @@ function AgendaView({
   completedTasks?: Record<string, boolean>;
   onToggleComplete?: (id: string) => void;
   onOpenDetail?: (target: DetailTarget) => void;
+  onMoveTaskToDay?: (taskId: string, projectId: string, itemId: string, kind: "task" | "subtask", newDay: DayKey, experimentId?: string, subTaskId?: string) => void;
+  onUpdateTitle?: (projectId: string, itemId: string, title: string, kind: "task" | "subtask", experimentId?: string, subTaskId?: string) => void;
 }) {
   const today = todayUTC();
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
   // Build per-day item list from all projects
   const dayItems = useMemo(() => {
@@ -1308,6 +1334,10 @@ function AgendaView({
         kind: "task" | "subtask" | "experiment";
         projectName: string;
         projectColor: string;
+        projectId: string;
+        itemId: string;
+        experimentId?: string;
+        subTaskId?: string;
         expTitle?: string;
         detail?: DetailTarget;
       }> = [];
@@ -1323,6 +1353,8 @@ function AgendaView({
                   kind: "task",
                   projectName: p.name,
                   projectColor: p.color,
+                  projectId: p.id,
+                  itemId: it.id,
                   detail: { kind: "item", projectId: p.id, laneId: lane.id, itemId: it.id },
                 });
               }
@@ -1335,6 +1367,10 @@ function AgendaView({
                   kind: "subtask",
                   projectName: p.name,
                   projectColor: p.color,
+                  projectId: p.id,
+                  itemId: it.id,
+                  experimentId: it.id,
+                  subTaskId: st.id,
                   expTitle: it.desc || undefined,
                   detail: { kind: "subtask", projectId: p.id, laneId: lane.id, experimentId: it.id, subTaskId: st.id, day },
                 });
@@ -1354,6 +1390,8 @@ function AgendaView({
             kind: "task" as const,
             projectName: proj?.name ?? "",
             projectColor: r.color,
+            projectId: r.projectId,
+            itemId: r.id,
           });
         }
       }
@@ -1364,6 +1402,23 @@ function AgendaView({
 
   const hasAnyItem = dayItems.some((d) => d.entries.length > 0);
 
+  function onAgendaDragEnd(ev: any) {
+    const activeId = String(ev.active.id);
+    const overId = ev.over ? String(ev.over.id) : null;
+    if (!activeId.startsWith("agenda-item:") || !overId || !overId.startsWith("agenda-day:")) return;
+    const entryId = activeId.slice("agenda-item:".length);
+    const newDay = overId.slice("agenda-day:".length) as DayKey;
+
+    // Find the entry across all days
+    for (const { entries } of dayItems) {
+      const entry = entries.find((e) => e.id === entryId);
+      if (entry) {
+        onMoveTaskToDay?.(entryId, entry.projectId, entry.itemId, entry.kind as "task" | "subtask", newDay, entry.experimentId, entry.subTaskId);
+        break;
+      }
+    }
+  }
+
   return (
     <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-2xl border shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
       {!hasAnyItem ? (
@@ -1371,6 +1426,7 @@ function AgendaView({
           No tasks planned in this period.
         </div>
       ) : (
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onAgendaDragEnd}>
         <div style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
           {/* Project color legend */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b px-5 py-2.5" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
@@ -1419,16 +1475,16 @@ function AgendaView({
                   );
                 })()}
 
-                {/* Items column */}
-                <div className="flex-1 px-4 py-3">
+                {/* Items column — droppable */}
+                <AgendaDayDrop day={day} darkMode={darkMode}>
                   {entries.length === 0 ? (
                     <div className="flex h-full min-h-[36px] items-center text-xs" style={{ color: darkMode ? '#48484a' : '#d4d4d8' }}>—</div>
                   ) : (
                     <div className="space-y-1">
                       {entries.map((entry) => (
+                        <AgendaDraggable key={entry.id} id={entry.id}>
                         <div
-                          key={entry.id}
-                          className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm"
+                          className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm cursor-grab active:cursor-grabbing"
                           style={{
                             opacity: completedTasks[entry.id] ? 0.5 : 1,
                           }}
@@ -1439,25 +1495,52 @@ function AgendaView({
                             type="checkbox"
                             checked={!!completedTasks[entry.id]}
                             onChange={() => onToggleComplete?.(entry.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            onPointerDown={(e) => e.stopPropagation()}
                             style={{ accentColor: entry.projectColor, cursor: "pointer", flexShrink: 0, width: 15, height: 15 }}
                           />
-                          <div className="flex-1 min-w-0">
-                            <span
-                              className="font-medium"
-                              style={{
-                                color: darkMode ? '#e5e5e7' : '#18181b',
-                                textDecoration: completedTasks[entry.id] ? 'line-through' : 'none',
-                              }}
-                            >
-                              {entry.title}
-                            </span>
-                            {entry.expTitle && (
-                              <span className="ml-1.5 text-[10px]" style={{ color: darkMode ? '#8e8e93' : '#a1a1aa' }}>({entry.expTitle})</span>
+                          <div className="flex-1 min-w-0" onClick={(e) => { e.stopPropagation(); setEditingId(entry.id); setEditingTitle(entry.title); }} onPointerDown={(e) => e.stopPropagation()}>
+                            {editingId === entry.id ? (
+                              <input
+                                autoFocus
+                                className="w-full rounded border px-1 py-0.5 text-sm font-medium outline-none"
+                                style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                                value={editingTitle}
+                                onChange={(e) => setEditingTitle(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    if (editingTitle.trim()) onUpdateTitle?.(entry.projectId, entry.itemId, editingTitle.trim(), entry.kind as "task" | "subtask", entry.experimentId, entry.subTaskId);
+                                    setEditingId(null);
+                                  }
+                                  if (e.key === "Escape") { setEditingId(null); }
+                                }}
+                                onBlur={() => {
+                                  if (editingTitle.trim()) onUpdateTitle?.(entry.projectId, entry.itemId, editingTitle.trim(), entry.kind as "task" | "subtask", entry.experimentId, entry.subTaskId);
+                                  setEditingId(null);
+                                }}
+                              />
+                            ) : (
+                              <>
+                                <span
+                                  className="font-medium cursor-text"
+                                  style={{
+                                    color: darkMode ? '#e5e5e7' : '#18181b',
+                                    textDecoration: completedTasks[entry.id] ? 'line-through' : 'none',
+                                  }}
+                                >
+                                  {entry.title}
+                                </span>
+                                {entry.expTitle && (
+                                  <span className="ml-1.5 text-[10px]" style={{ color: darkMode ? '#8e8e93' : '#a1a1aa' }}>({entry.expTitle})</span>
+                                )}
+                              </>
                             )}
                           </div>
                           {entry.detail && (
                             <button
                               onClick={(e) => { e.stopPropagation(); onOpenDetail?.(entry.detail!); }}
+                              onPointerDown={(e) => e.stopPropagation()}
                               style={{
                                 flexShrink: 0,
                                 width: 24,
@@ -1476,14 +1559,16 @@ function AgendaView({
                             >⋯</button>
                           )}
                         </div>
+                        </AgendaDraggable>
                       ))}
                     </div>
                   )}
-                </div>
+                </AgendaDayDrop>
               </div>
             );
           })}
         </div>
+        </DndContext>
       )}
     </div>
   );
@@ -4867,7 +4952,33 @@ useEffect(() => {
                 [taskId]: { id: taskId, day, startMin, endMin: startMin + 60 },
               }));
             }}
-            onMoveEvent={(id, patch) => setTimedEvents((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }))}
+            onMoveEvent={(id, patch) => {
+              setTimedEvents((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+              // If day changed, also update the plan task's start/end date
+              if (patch.day) {
+                const newDay = patch.day;
+                // id format is "t:projectId:itemId" or "st:projectId:expId:stId"
+                if (id.startsWith("t:")) {
+                  const parts = id.split(":");
+                  const projectId = parts[1];
+                  const itemId = parts[2];
+                  setProjects((prev) => {
+                    const next = structuredClone(prev) as Project[];
+                    const p = next.find((pp) => pp.id === projectId);
+                    if (!p) return prev;
+                    for (const lane of p.lanes) {
+                      const it = lane.items.find((x) => x.id === itemId);
+                      if (it && it.type === "task") {
+                        it.start = newDay;
+                        it.end = newDay;
+                        return next;
+                      }
+                    }
+                    return prev;
+                  });
+                }
+              }
+            }}
             onDeleteEvent={(id) => setTimedEvents((prev) => { const n = { ...prev }; delete n[id]; return n; })}
             onAddRecurring={(r) => setRecurring((prev) => [...prev, r])}
             onDeleteRecurring={(rid) => setRecurring((prev) => prev.filter((r) => r.id !== rid))}
@@ -4917,6 +5028,56 @@ useEffect(() => {
             completedTasks={completedTasks}
             onToggleComplete={(id) => setCompletedTasks(prev => ({ ...prev, [id]: !prev[id] }))}
             onOpenDetail={(target) => setDetailTarget(target)}
+            onMoveTaskToDay={(taskId, projectId, itemId, kind, newDay, experimentId, subTaskId) => {
+              setProjects((prev) => {
+                const next = structuredClone(prev) as Project[];
+                const p = next.find((pp) => pp.id === projectId);
+                if (!p) return prev;
+                if (kind === "task") {
+                  for (const lane of p.lanes) {
+                    const it = lane.items.find((x) => x.id === itemId);
+                    if (it && it.type === "task") {
+                      it.start = newDay;
+                      it.end = newDay;
+                      return next;
+                    }
+                  }
+                } else if (kind === "subtask" && experimentId && subTaskId) {
+                  for (const lane of p.lanes) {
+                    const exp = lane.items.find((x) => x.id === experimentId);
+                    if (!exp || exp.type !== "experiment") continue;
+                    // Find and remove subtask from old day
+                    for (const [day, arr] of Object.entries(exp.subTasks)) {
+                      const idx = arr.findIndex((s: any) => s.id === subTaskId);
+                      if (idx >= 0) {
+                        const [st] = arr.splice(idx, 1);
+                        st.day = newDay;
+                        if (!exp.subTasks[newDay]) exp.subTasks[newDay] = [];
+                        exp.subTasks[newDay].push(st);
+                        // Extend experiment range if subtask moved outside
+                        if (compareDay(newDay, exp.start) < 0) exp.start = newDay;
+                        if (compareDay(newDay, exp.end) > 0) exp.end = newDay;
+                        return next;
+                      }
+                    }
+                  }
+                }
+                return prev;
+              });
+              // Also update timed event if exists
+              const catalogId = `t:${projectId}:${itemId}`;
+              setTimedEvents((prev) => {
+                if (!prev[catalogId]) return prev;
+                return { ...prev, [catalogId]: { ...prev[catalogId], day: newDay } };
+              });
+            }}
+            onUpdateTitle={(projectId, itemId, title, kind, experimentId, subTaskId) => {
+              if (kind === "task") {
+                updateItemTitle(projectId, itemId, title);
+              } else if (kind === "subtask" && experimentId && subTaskId) {
+                updateExperimentSubTaskTitle(projectId, experimentId, subTaskId, title);
+              }
+            }}
           />
         )}
 
