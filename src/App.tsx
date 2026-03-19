@@ -744,9 +744,9 @@ function seed(base: DayKey): Project[] {
     end: addDays(base, 8),
     subTasks: {
       [addDays(base, 2)]: [{ id: "st1", title: "Seeds to shelves + fridge", day: addDays(base, 2) }],
-      [addDays(base, 4)]: [{ id: "st2", title: "Vyndat z lednice → box", day: addDays(base, 4) }],
+      [addDays(base, 4)]: [{ id: "st2", title: "Remove from fridge → box", day: addDays(base, 4) }],
       [addDays(base, 7)]: [
-        { id: "st3", title: "Mikroskop", day: addDays(base, 7) },
+        { id: "st3", title: "Microscope", day: addDays(base, 7) },
         { id: "st4", title: "Data backup", day: addDays(base, 7) },
       ],
     },
@@ -1690,10 +1690,10 @@ function CalendarView({
           {...(isRec || isSelected ? {} : attributes)}
           {...(isRec || isSelected ? {} : listeners)}
           className={
-            "relative h-full rounded-lg px-2 py-1 text-xs font-semibold text-white shadow-sm overflow-hidden " +
+            "relative h-full rounded-lg px-2 py-1 text-xs font-semibold text-white shadow-sm overflow-hidden border " +
             (isRec ? "cursor-default" : isSelected ? "cursor-default ring-2 ring-white/60" : "cursor-grab active:cursor-grabbing")
           }
-          style={{ background: color }}
+          style={{ background: color, borderColor: 'rgba(0,0,0,0.25)' }}
           title={!isSelected ? title : undefined}
           onClick={(e) => {
             e.stopPropagation();
@@ -2217,7 +2217,7 @@ function CalendarView({
                   style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
                   onClick={() => setRecurringModal(false)}
                 >
-                  Zrušit
+                  Cancel
                 </button>
                 <div className="flex items-center gap-2">
                   {editingRecId && (
@@ -2561,7 +2561,7 @@ function DetailPanel({
               onClick={addCheckItem}
               style={{ fontSize: 11, fontWeight: 600, color: projColor, cursor: "pointer", background: "none", border: "none", padding: "2px 6px" }}
             >
-              + přidat
+              + add
             </button>
           </div>
 
@@ -2897,7 +2897,7 @@ const stored = readStored();
   const [timedEvents, setTimedEvents] = useState<Record<string, TimedEvent>>(() => stored?.timedEvents ?? {});
   const [recurring, setRecurring] = useState<RecurringEvent[]>(() =>
     stored?.recurring ?? [
-      { id: "r1", title: "Meeting s Matesem", color: "#0ea5e9", weekday: 4, startMin: 9 * 60, endMin: 10 * 60 },
+      { id: "r1", title: "Weekly meeting", color: "#0ea5e9", weekday: 4, startMin: 9 * 60, endMin: 10 * 60 },
       { id: "r2", title: "Department seminar", color: "#a855f7", weekday: 3, startMin: 13 * 60, endMin: 14 * 60 },
     ]
   );
@@ -2928,6 +2928,12 @@ const stored = readStored();
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [planRecurringModal, setPlanRecurringModal] = useState(false);
   const [planRecForm, setPlanRecForm] = useState<{ projectId: string; title: string; weekday: number }>({ projectId: "", title: "", weekday: 1 });
+  const [addTaskModal, setAddTaskModal] = useState(false);
+  const [addTaskForm, setAddTaskForm] = useState<{
+    projectId: string; title: string; notes: string; day: string; 
+    timeEnabled: boolean; startTime: string; endTime: string;
+    recurring: boolean; recurringWeekday: number;
+  }>({ projectId: "", title: "", notes: "", day: todayUTC(), timeEnabled: false, startTime: "09:00", endTime: "10:00", recurring: false, recurringWeekday: 1 });
   const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [newInboxTitle, setNewInboxTitle] = useState<string>("");
 
@@ -2990,12 +2996,17 @@ useEffect(() => {
     planRORef.current = ro;
 
     measurePlanW();
+    // Delayed re-measure to catch layout shifts after cloud state loads
+    const t1 = setTimeout(measurePlanW, 100);
+    const t2 = setTimeout(measurePlanW, 500);
     window.addEventListener("resize", measurePlanW);
     return () => {
       window.removeEventListener("resize", measurePlanW);
+      clearTimeout(t1);
+      clearTimeout(t2);
       ro.disconnect();
     };
-  }, [viewMode, windowLen]); // re-attach when view or windowLen changes
+  }, [viewMode, windowLen, loadingCloud]); // also re-measure when cloud loading finishes
 
   const makeSnapshot = (): PersistedStateV1 => ({
     version: 1,
@@ -4432,7 +4443,7 @@ useEffect(() => {
                   style={viewMode === "plan" ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
                   onClick={() => setViewMode("plan")}
                 >
-                  Plán
+                  Plan
                 </button>
                 <button
                   className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
@@ -4471,12 +4482,9 @@ useEffect(() => {
                 ))}
               </div>
 
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => addProject()}>+ project</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setPlanRecurringModal(true)}>+ recurring task</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export JSON</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">Export ICS</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => generateShareURL()} title="Share plan link">Share</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportPNG()} title="Export as PNG screenshot">📸 PNG</button>
+              <button className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm" style={{ background: darkMode ? '#3b82f6' : '#2563eb', color: 'white', borderColor: darkMode ? '#2563eb' : '#1d4ed8' }} onClick={() => setAddTaskModal(true)}>+ Task</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
               <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => fileInputRef.current?.click()}>Import</button>
               <input
                 ref={fileInputRef}
@@ -4498,12 +4506,11 @@ useEffect(() => {
               >
                 {darkMode ? "☀️" : "🌙"}
               </button>
-              {/* Autosave indicator */}
+              {/* Autosave indicator — plain text */}
               {savedAt && (
-                <div className="flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#a1a1aa' }}>
-                  <div className="h-1.5 w-1.5 rounded-full bg-green-400" />
+                <span className="text-xs" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>
                   saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                </div>
+                </span>
               )}
               {archivedProjects.length > 0 && (
                 <button
@@ -4660,18 +4667,18 @@ useEffect(() => {
                         className="flex items-center gap-2 border-b px-3 py-2 dm-project-header"
                         style={{ minWidth: days.length * cellW, borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}
                       >
-                        {/* Reorder buttons — horizontal */}
-                        <div className="flex flex-shrink-0 gap-0.5">
+                        {/* Reorder buttons — vertical */}
+                        <div className="flex flex-col flex-shrink-0 gap-0.5">
                           <button
                             className="h-5 w-5 rounded text-center text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100 leading-none text-[10px]"
                             onClick={(e) => { e.stopPropagation(); moveProject(project.id, "up"); }}
                             title="Move project up"
-                          >◀</button>
+                          >▲</button>
                           <button
                             className="h-5 w-5 rounded text-center text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100 leading-none text-[10px]"
                             onClick={(e) => { e.stopPropagation(); moveProject(project.id, "down"); }}
                             title="Move project down"
-                          >▶</button>
+                          >▼</button>
                         </div>
                         <button
                           className="flex-shrink-0 w-4 text-center text-zinc-400 hover:text-zinc-700"
@@ -4693,6 +4700,13 @@ useEffect(() => {
                           title={cascadedProjects[project.id] ? "Switch to compact view" : "Sort lanes into cascade (Gantt)"}
                         >
                           ⚡
+                        </button>
+                        <button
+                          className="text-xs text-zinc-400 hover:text-zinc-700"
+                          onClick={(e) => { e.stopPropagation(); setDetailTarget({ kind: "project", projectId: project.id }); }}
+                          title="Project notes & checklist"
+                        >
+                          📝
                         </button>
                         <input
                           type="color"
@@ -4732,10 +4746,10 @@ useEffect(() => {
                         )}
                         <button
                           className="text-xs text-zinc-400 hover:text-zinc-700"
-                          onClick={(e) => { e.stopPropagation(); setDetailTarget({ kind: "project", projectId: project.id }); }}
-                          title="Project notes & checklist"
+                          onClick={(e) => { e.stopPropagation(); addProject(); }}
+                          title="Add new project"
                         >
-                          📝
+                          + project
                         </button>
                         {/* Close / remove project button */}
                         {closeConfirm === project.id ? (
@@ -4787,8 +4801,16 @@ useEffect(() => {
                         )}
                       </div>
 
-                      {/* Lanes */}
-                      {!isCollapsed && project.lanes.map((lane) => (
+                      {/* Lanes — only show lanes that have items visible in the current window, plus one empty lane */}
+                      {!isCollapsed && (() => {
+                        const visibleLanes = project.lanes.filter((lane) =>
+                          lane.items.some((it) => !(compareDay(it.end, days[0]) < 0 || compareDay(days[days.length - 1], it.start) < 0))
+                        );
+                        const emptyLanes = project.lanes.filter((lane) => !visibleLanes.includes(lane));
+                        // Always include one empty lane at the end for adding new items
+                        const firstEmpty = emptyLanes[0];
+                        const lanesToRender = firstEmpty ? [...visibleLanes, firstEmpty] : visibleLanes;
+                        return lanesToRender.map((lane) => (
                         <LaneRow
                           key={lane.id}
                           project={project}
@@ -4817,7 +4839,8 @@ useEffect(() => {
                           planRecurringInstances={planRecurringInstances}
                           onOpenDetail={(target) => setDetailTarget(target)}
                         />
-                      ))}
+                      ));
+                      })()}
                     </div>
                     );
                   })}
@@ -4897,36 +4920,6 @@ useEffect(() => {
           />
         )}
 
-        {/* ---- SHARE URL MODAL ---- */}
-        {shareModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setShareModalOpen(false)}>
-            <div className="w-full max-w-lg rounded-2xl border border-zinc-200 bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center justify-between mb-4">
-                <div className="text-sm font-semibold">Share plan</div>
-                <button className="h-8 w-8 rounded-full border border-zinc-200 bg-white hover:bg-zinc-50" onClick={() => setShareModalOpen(false)}>✕</button>
-              </div>
-              <p className="text-xs text-zinc-500 mb-3">Copy the link below — it contains the entire planner state. Anyone who opens it will load your plan.</p>
-              <div className="flex gap-2">
-                <input
-                  readOnly
-                  className="flex-1 rounded-lg border border-zinc-200 px-3 py-2 text-xs font-mono text-zinc-700 outline-none bg-zinc-50 truncate"
-                  value={shareURL}
-                  onClick={(e) => (e.target as HTMLInputElement).select()}
-                />
-                <button
-                  className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-semibold text-white hover:bg-zinc-800 whitespace-nowrap"
-                  onClick={() => {
-                    navigator.clipboard.writeText(shareURL);
-                  }}
-                >
-                  Kopírovat
-                </button>
-              </div>
-              <p className="mt-3 text-[11px] text-zinc-400">⚠️ The URL is very long — use it for sharing only, not as a bookmark. Data is encoded directly in the link.</p>
-            </div>
-          </div>
-        )}
-
         {/* ---- PLAN RECURRING MODAL ---- */}
         {planRecurringModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setPlanRecurringModal(false)}>
@@ -5000,6 +4993,149 @@ useEffect(() => {
                   })}
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* ---- ADD TASK MODAL ---- */}
+        {addTaskModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setAddTaskModal(false)}>
+            <div className="w-full max-w-md rounded-2xl border bg-white p-4 shadow-xl dm-popover" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Add task</div>
+                <button className="h-8 w-8 rounded-full border hover:bg-zinc-50 dm-btn" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }} onClick={() => setAddTaskModal(false)}>✕</button>
+              </div>
+              <div className="space-y-3">
+                <div>
+                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Project</div>
+                  <select
+                    className="h-9 w-full rounded-lg border px-2 text-sm dm-input"
+                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    value={addTaskForm.projectId || projects[0]?.id || ""}
+                    onChange={(e) => setAddTaskForm((p) => ({ ...p, projectId: e.target.value }))}
+                  >
+                    {projects.map((pp) => <option key={pp.id} value={pp.id}>{pp.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Task name</div>
+                  <input
+                    autoFocus
+                    className="h-9 w-full rounded-lg border px-3 text-sm outline-none focus:ring-2 focus:ring-blue-300 dm-input"
+                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    placeholder="e.g. Write report, Team meeting…"
+                    value={addTaskForm.title}
+                    onChange={(e) => setAddTaskForm((p) => ({ ...p, title: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Notes (optional)</div>
+                  <textarea
+                    className="h-16 w-full resize-none rounded-lg border p-2 text-sm outline-none focus:ring-2 focus:ring-blue-300 dm-input"
+                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    placeholder="Details, links, context…"
+                    value={addTaskForm.notes}
+                    onChange={(e) => setAddTaskForm((p) => ({ ...p, notes: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Date</div>
+                  <input
+                    type="date"
+                    className="h-9 w-full rounded-lg border px-3 text-sm dm-input"
+                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    value={addTaskForm.day}
+                    onChange={(e) => setAddTaskForm((p) => ({ ...p, day: e.target.value }))}
+                  />
+                </div>
+                <div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>
+                    <input type="checkbox" checked={addTaskForm.timeEnabled} onChange={(e) => setAddTaskForm((p) => ({ ...p, timeEnabled: e.target.checked }))} />
+                    Schedule time (show in calendar)
+                  </label>
+                  {addTaskForm.timeEnabled && (
+                    <div className="flex gap-2 mt-1">
+                      <input type="time" className="h-8 flex-1 rounded-lg border px-2 text-sm dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                        value={addTaskForm.startTime} onChange={(e) => setAddTaskForm((p) => ({ ...p, startTime: e.target.value }))} />
+                      <span className="text-xs self-center" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>to</span>
+                      <input type="time" className="h-8 flex-1 rounded-lg border px-2 text-sm dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                        value={addTaskForm.endTime} onChange={(e) => setAddTaskForm((p) => ({ ...p, endTime: e.target.value }))} />
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>
+                    <input type="checkbox" checked={addTaskForm.recurring} onChange={(e) => setAddTaskForm((p) => ({ ...p, recurring: e.target.checked }))} />
+                    Repeat weekly
+                  </label>
+                  {addTaskForm.recurring && (
+                    <div className="flex gap-1 flex-wrap mt-1">
+                      {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => (
+                        <button
+                          key={i}
+                          className={"rounded-lg px-3 py-1.5 text-xs font-medium border " + (addTaskForm.recurringWeekday === i ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50")}
+                          onClick={() => setAddTaskForm((p) => ({ ...p, recurringWeekday: i }))}
+                        >{d}</button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="mt-4 flex justify-end">
+                <button
+                  className="h-9 rounded-lg px-5 text-sm font-semibold text-white"
+                  style={{ background: '#2563eb' }}
+                  onClick={() => {
+                    const pid = addTaskForm.projectId || projects[0]?.id;
+                    if (!pid || !addTaskForm.title.trim()) return;
+                    const proj = projects.find((p) => p.id === pid);
+                    if (!proj) return;
+                    const laneId = proj.lanes[0]?.id;
+                    if (!laneId) return;
+
+                    // Create the task in plan
+                    const createdId = `it_${crypto.randomUUID()}`;
+                    const catalogId = `t:${pid}:${createdId}`;
+                    const item: LaneItem = { 
+                      id: createdId, type: "task", title: addTaskForm.title.trim(), 
+                      start: addTaskForm.day, end: addTaskForm.day,
+                      ...(addTaskForm.notes.trim() ? { notes: addTaskForm.notes.trim() } : {}),
+                    };
+                    setProjects((prev) => {
+                      const next = structuredClone(prev) as Project[];
+                      const pIdx = next.findIndex((p) => p.id === pid);
+                      if (pIdx === -1) return prev;
+                      next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
+                      return next;
+                    });
+
+                    // Optionally schedule in calendar
+                    if (addTaskForm.timeEnabled) {
+                      const [sh, sm] = addTaskForm.startTime.split(":").map(Number);
+                      const [eh, em] = addTaskForm.endTime.split(":").map(Number);
+                      const startMin = sh * 60 + sm;
+                      const endMin = eh * 60 + em;
+                      setTimedEvents((prev) => ({
+                        ...prev,
+                        [catalogId]: { id: catalogId, day: addTaskForm.day, startMin, endMin: endMin > startMin ? endMin : startMin + 60 },
+                      }));
+                    }
+
+                    // Optionally add recurring
+                    if (addTaskForm.recurring) {
+                      setPlanRecurring((prev) => [...prev, { 
+                        id: `pr_${crypto.randomUUID()}`, projectId: pid, 
+                        title: addTaskForm.title.trim(), weekday: addTaskForm.recurringWeekday 
+                      }]);
+                    }
+
+                    setAddTaskForm((prev) => ({ ...prev, title: "", notes: "", timeEnabled: false, recurring: false }));
+                    setAddTaskModal(false);
+                  }}
+                >
+                  Add task
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -5124,7 +5260,7 @@ useEffect(() => {
               </div>
 
               {dayAgenda.length === 0 ? (
-                <div className="mt-3 text-sm text-zinc-500">Žádné úkoly.</div>
+                <div className="mt-3 text-sm text-zinc-500">No tasks.</div>
               ) : (
                 <div className="mt-3 space-y-3">
                   {dayAgenda.map(({ project, rows }) => (
