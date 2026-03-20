@@ -5517,6 +5517,7 @@ useEffect(() => {
                 </div>
               )}
             </div>
+            </div>
           </div>
         )}
         {/* Day agenda popover */}
