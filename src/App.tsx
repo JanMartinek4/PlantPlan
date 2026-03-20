@@ -67,7 +67,7 @@ type PersistedStateV1 = {
   windowStart: DayKey;
   windowLen: 7 | 14 | 28;
   viewMode: ViewMode;
-  calendarDaysLen: 3 | 5 | 7;
+  calendarDaysLen: 1 | 2 | 3 | 5 | 7;
   projects: Project[];
   timedEvents: Record<string, TimedEvent>;
   recurring: RecurringEvent[];
@@ -1645,8 +1645,8 @@ function CalendarView({
   onUpdateRecurring: (rid: string, patch: Partial<RecurringEvent>) => void;
   recurringModal: boolean;
   setRecurringModal: React.Dispatch<React.SetStateAction<boolean>>;
-  calendarDaysLen: 3 | 5 | 7;
-  setCalendarDaysLen: React.Dispatch<React.SetStateAction<3 | 5 | 7>>;
+  calendarDaysLen: 1 | 2 | 3 | 5 | 7;
+  setCalendarDaysLen: React.Dispatch<React.SetStateAction<1 | 2 | 3 | 5 | 7>>;
   sensors: any;
   resizeEvt: { id: string; pointerId: number } | null;
   setResizeEvt: React.Dispatch<React.SetStateAction<{ id: string; pointerId: number } | null>>;
@@ -2111,13 +2111,13 @@ function CalendarView({
             onClick={() => openNewRecurring()}
             title="Add recurring block"
           >
-            + opakování
+            + recurring
           </button>
         </div>
         <div className="flex items-center gap-2">
-          <div className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Dny:</div>
+          <div className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Days:</div>
           <div className="flex items-center gap-1 rounded-lg border p-1" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-            {([3, 5, 7] as const).map((n) => (
+            {([1, 2, 3, 5, 7] as const).map((n) => (
               <button
                 key={n}
                 className="rounded-md px-2 py-1 text-xs hover:opacity-80"
@@ -2367,7 +2367,7 @@ function CalendarView({
               </div>
 
               <div className="text-[11px]" style={{ color: darkMode ? '#8e8e93' : '#52525b' }}>
-                Opakování je samostatný blok. Klikni na blok nebo ↻ pro úpravu.
+                Recurring events are separate blocks. Click the block or ↻ to edit.
               </div>
             </div>
           </div>
@@ -3006,9 +3006,17 @@ const stored = readStored();
       ),
     }));
 
+  // Mobile detection
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', check);
+    return () => window.removeEventListener('resize', check);
+  }, []);
+
   const [windowStart, setWindowStart] = useState<DayKey>(() => stored?.windowStart ?? addDays(todayUTC(), -2));
   const [viewMode, setViewMode] = useState<ViewMode>(() => stored?.viewMode ?? "plan");
-  const [calendarDaysLen, setCalendarDaysLen] = useState<3 | 5 | 7>(() => stored?.calendarDaysLen ?? 5);
+  const [calendarDaysLen, setCalendarDaysLen] = useState<1 | 2 | 3 | 5 | 7>(() => stored?.calendarDaysLen ?? 5);
   const [timedEvents, setTimedEvents] = useState<Record<string, TimedEvent>>(() => stored?.timedEvents ?? {});
   const [recurring, setRecurring] = useState<RecurringEvent[]>(() =>
     stored?.recurring ?? [
@@ -4489,12 +4497,12 @@ useEffect(() => {
   }, [dayFocus, projects, planRecurring, recurring]);
 
   const cellW = useMemo(() => {
-    if (!planW) return 120;
+    if (!planW) return isMobile ? 60 : 120;
     const usable = planW;
     const raw = usable / Math.max(1, days.length);
-    const min = windowLen === 28 ? 36 : windowLen === 14 ? 60 : 80;
+    const min = isMobile ? (windowLen === 28 ? 28 : windowLen === 14 ? 40 : 48) : (windowLen === 28 ? 36 : windowLen === 14 ? 60 : 80);
     return Math.floor(Math.max(min, raw));
-  }, [planW, days.length, windowLen]);
+  }, [planW, days.length, windowLen, isMobile]);
 
   if (loadingAuth) {
     return <div style={{ padding: 16 }}>Loading…</div>;
@@ -4583,7 +4591,7 @@ useEffect(() => {
       `}</style>
       <div
         data-app-interactive
-        className="h-screen overflow-hidden p-6"
+        className={isMobile ? "h-screen overflow-hidden p-2" : "h-screen overflow-hidden p-6"}
         style={({ 
           background: darkMode ? '#1c1c1e' : '#fafafa', 
           color: darkMode ? '#e5e5e7' : '#18181b',
@@ -4600,59 +4608,59 @@ useEffect(() => {
       <DndContext sensors={sensors} collisionDetection={collisionDetection} onDragEnd={onDragEnd}>
       <div className="mx-auto flex h-full max-w-[1500px] flex-col">
         {/* Sticky top bar */}
-        <div className="sticky top-0 z-50 pb-4" style={{ background: darkMode ? '#1c1c1e' : '#fafafa' }}>
-          <div className="flex items-start justify-between gap-4" data-print-hide>
-            <div className="flex items-center gap-2">
+        <div className={isMobile ? "sticky top-0 z-50 pb-2" : "sticky top-0 z-50 pb-4"} style={{ background: darkMode ? '#1c1c1e' : '#fafafa' }}>
+          <div className={isMobile ? "flex flex-col gap-2" : "flex items-start justify-between gap-4"} data-print-hide>
+            {/* Row 1: View toggle + navigation */}
+            <div className="flex items-center gap-1.5 flex-wrap">
               {/* View mode toggle */}
-              <div className="flex items-center gap-1 rounded-xl border p-1 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-                <button
-                  className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
-                  style={viewMode === "plan" ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                  onClick={() => setViewMode("plan")}
-                >
-                  Plan
-                </button>
-                <button
-                  className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
-                  style={viewMode === "calendar" ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                  onClick={() => setViewMode("calendar")}
-                >
-                  Calendar
-                </button>
-                <button
-                  className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
-                  style={viewMode === "agenda" ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                  onClick={() => setViewMode("agenda")}
-                >
-                  Agenda
-                </button>
-              </div>
-
-              {/* Navigation */}
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀︎ -{windowLen}</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎ -1</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart(() => addDays(todayUTC(), -2))}>Today</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>+1 ▶︎</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>+{windowLen} ▶︎</button>
-
-              {/* Window length toggle */}
-              <div className="flex items-center gap-1 rounded-xl border p-1 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-                {([7, 14, 28] as const).map((n) => (
+              <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                {(["plan", "calendar", "agenda"] as const).map((v) => (
                   <button
-                    key={n}
-                    className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
-                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                    onClick={() => setWindowLen(n)}
+                    key={v}
+                    className={isMobile ? "rounded-lg px-2 py-1 text-xs hover:opacity-80" : "rounded-lg px-3 py-1.5 text-sm hover:opacity-80"}
+                    style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    onClick={() => setViewMode(v)}
                   >
-                    {n === 28 ? "4 weeks" : `${n} days`}
+                    {v === "plan" ? "Plan" : v === "calendar" ? "Calendar" : "Agenda"}
                   </button>
                 ))}
               </div>
 
-              <button className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm" style={{ background: darkMode ? '#3b82f6' : '#2563eb', color: 'white', borderColor: darkMode ? '#2563eb' : '#1d4ed8' }} onClick={() => setAddTaskModal(true)}>+ Task</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => fileInputRef.current?.click()}>Import</button>
+              {/* Navigation — compact on mobile */}
+              <div className="flex items-center gap-1">
+                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{isMobile ? "◀◀" : `◀︎ -${windowLen}`}</button>
+                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
+                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart(() => addDays(todayUTC(), -2))}>Today</button>
+                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
+                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{isMobile ? "▶▶" : `+${windowLen} ▶︎`}</button>
+              </div>
+
+              {/* Window length toggle */}
+              <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                {([7, 14, 28] as const).map((n) => (
+                  <button
+                    key={n}
+                    className={isMobile ? "rounded-lg px-2 py-1 text-xs hover:opacity-80" : "rounded-lg px-3 py-1.5 text-sm hover:opacity-80"}
+                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    onClick={() => setWindowLen(n)}
+                  >
+                    {isMobile ? n : (n === 28 ? "4 weeks" : `${n} days`)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Row 2: Actions */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <button className={`rounded-xl border ${isMobile ? 'px-3 py-1.5 text-xs' : 'px-4 py-2 text-sm'} font-semibold shadow-sm`} style={{ background: darkMode ? '#3b82f6' : '#2563eb', color: 'white', borderColor: darkMode ? '#2563eb' : '#1d4ed8' }} onClick={() => {
+                if (projects.length === 0) addProject();
+                setAddTaskModal(true);
+              }}>+ Task</button>
+              {!isMobile && <>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => fileInputRef.current?.click()}>Import</button>
+              </>}
               <input
                 ref={fileInputRef}
                 type="file"
@@ -4664,9 +4672,9 @@ useEffect(() => {
                   e.currentTarget.value = "";
                 }}
               />
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>Inbox</button>
+              <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>{isMobile ? "📥" : "Inbox"}</button>
               <button 
-                className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn"
+                className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`}
                 style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
                 onClick={() => setDarkMode((v) => !v)}
                 title={darkMode ? "Light mode" : "Dark mode"}
@@ -4675,18 +4683,18 @@ useEffect(() => {
               </button>
               {/* Autosave indicator — plain text */}
               {savedAt && (
-                <span className="text-xs" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>
+                <span className={isMobile ? "text-[10px]" : "text-xs"} style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>
                   saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                 </span>
               )}
               {archivedProjects.length > 0 && (
                 <button
-                  className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn"
+                  className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`}
                   style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }}
                   onClick={() => setShowArchive((v) => !v)}
                   title="Archived projects"
                 >
-                  Archive ({archivedProjects.length})
+                  {isMobile ? "📦" : `Archive (${archivedProjects.length})`}
                 </button>
               )}
             </div>
@@ -4783,7 +4791,7 @@ useEffect(() => {
                   {/* Archive panel */}
                   {showArchive && archivedProjects.length > 0 && (
                     <div
-                      className="fixed right-6 top-24 z-40 w-[340px] rounded-2xl border border-zinc-200 bg-white shadow-xl"
+                      className={isMobile ? "fixed inset-x-2 top-16 z-40 rounded-2xl" : "fixed right-6 top-24 z-40 w-[340px]"} data-inbox-panel rounded-2xl border border-zinc-200 bg-white shadow-xl"
                       onClick={(e) => e.stopPropagation()}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -4825,6 +4833,18 @@ useEffect(() => {
                   )}
 
                   {/* Projects + lanes */}
+                  {projectsWithRecurring.length === 0 && (
+                    <div className="flex flex-col items-center justify-center py-16 px-4">
+                      <div className="text-4xl mb-3">🌱</div>
+                      <div className="text-sm font-medium mb-1" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>No projects yet</div>
+                      <div className="text-xs mb-4 text-center" style={{ color: darkMode ? '#8e8e93' : '#a1a1aa' }}>Create your first project to start planning.</div>
+                      <button
+                        className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm"
+                        style={{ background: '#2563eb', color: 'white', borderColor: '#1d4ed8' }}
+                        onClick={() => addProject()}
+                      >+ Create project</button>
+                    </div>
+                  )}
                   {projectsWithRecurring.map((project) => {
                     const isCollapsed = !!collapsedProjects[project.id];
                     return (
@@ -5369,7 +5389,7 @@ useEffect(() => {
         {/* ---- GLOBAL INBOX PANEL (all views) ---- */}
         {inboxOpen && (
           <div
-            className="fixed right-6 top-24 z-40 w-[340px] rounded-2xl border shadow-xl"
+            className={isMobile ? "fixed inset-x-2 top-16 z-40 rounded-2xl" : "fixed right-6 top-24 z-40 w-[340px]"} data-inbox-panel rounded-2xl border shadow-xl"
             style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
