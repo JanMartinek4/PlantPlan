@@ -3,6 +3,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   PointerSensor,
+  TouchSensor,
   closestCenter,
   pointerWithin,
   useDraggable,
@@ -65,7 +66,7 @@ type PlanRecurring = {
 type PersistedStateV1 = {
   version: 1;
   windowStart: DayKey;
-  windowLen: 7 | 14 | 28;
+  windowLen: 5 | 7 | 14 | 28;
   viewMode: ViewMode;
   calendarDaysLen: 1 | 2 | 3 | 5 | 7;
   projects: Project[];
@@ -427,7 +428,8 @@ function DroppableCell({
       style={{ 
         width,
         background: isToday ? 'var(--today-bg)' : isWeekend ? 'var(--weekend-bg)' : 'var(--cell-bg)',
-        borderColor: 'var(--cell-border)'
+        borderColor: 'var(--cell-border)',
+        touchAction: 'none',
       }}
       className={
         "relative h-20 border-b border-r " +
@@ -1330,7 +1332,10 @@ function AgendaView({
   const today = todayUTC();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 6 } })
+  );
 
   // Build per-day item list from all projects
   const dayItems = useMemo(() => {
@@ -2101,8 +2106,8 @@ function CalendarView({
   }, [events, recurringInstances, days]);
 
   return (
-    <div className="mt-6 rounded-2xl border p-4 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-      <div className="flex items-center justify-between">
+    <div className="mt-6 rounded-2xl border shadow-sm flex flex-col" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', maxHeight: 'calc(100vh - 200px)' }}>
+      <div className="flex items-center justify-between p-4 pb-0 flex-shrink-0">
         <div className="flex items-center gap-2">
           <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Calendar</div>
           <button
@@ -2132,7 +2137,7 @@ function CalendarView({
       </div>
 
       <DndContext sensors={sensors} collisionDetection={collisionDetection} onDragEnd={onCalDragEnd}>
-        <div className="mt-4 overflow-x-auto">
+        <div className="mt-4 overflow-auto flex-1 px-4 pb-4">
           <div ref={calWrapRef} style={{ width: "100%", minWidth: 56 + days.length * 80 }}>
             {/* Per-day inbox row */}
             <div className="flex" style={{ width: "100%" }}>
@@ -3028,7 +3033,7 @@ const stored = readStored();
   const [recurringModal, setRecurringModal] = useState(false);
   const [resizeEvt, setResizeEvt] = useState<{ id: string; pointerId: number } | null>(null);
 
-  const [windowLen, setWindowLen] = useState<7 | 14 | 28>(() => stored?.windowLen ?? 14);
+  const [windowLen, setWindowLen] = useState<5 | 7 | 14 | 28>(() => stored?.windowLen ?? 14);
   const [projects, setProjects] = useState<Project[]>(() =>
     stored?.projects ? normalizeProjects(stored.projects) : seed(stored?.windowStart ?? windowStart)
   );
@@ -3611,7 +3616,10 @@ useEffect(() => {
     return Object.values(timedEvents).filter((e) => calDays.includes(e.day));
   }, [timedEvents, calDays]);
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 6 } })
+  );
 
   const collisionDetection = (args: any) => {
     const within = pointerWithin(args);
@@ -4630,19 +4638,24 @@ useEffect(() => {
               <div className="flex items-center gap-1">
                 <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{isMobile ? "◀◀" : `◀︎ -${windowLen}`}</button>
                 <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
-                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart(() => addDays(todayUTC(), -2))}>Today</button>
+                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => {
+                  // For small calendar views (1-2 days), set today as first day
+                  // For plan view and larger calendar, offset by -2 so today is visible but not at edge
+                  const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2;
+                  setWindowStart(() => addDays(todayUTC(), offset));
+                }}>Today</button>
                 <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
                 <button className={`rounded-xl border ${isMobile ? 'px-2 py-1.5 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{isMobile ? "▶▶" : `+${windowLen} ▶︎`}</button>
               </div>
 
               {/* Window length toggle */}
               <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-                {([7, 14, 28] as const).map((n) => (
+                {(isMobile ? [5, 7, 14, 28] as const : [7, 14, 28] as const).map((n) => (
                   <button
                     key={n}
                     className={isMobile ? "rounded-lg px-2 py-1 text-xs hover:opacity-80" : "rounded-lg px-3 py-1.5 text-sm hover:opacity-80"}
                     style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                    onClick={() => setWindowLen(n)}
+                    onClick={() => setWindowLen(n as any)}
                   >
                     {isMobile ? n : (n === 28 ? "4 weeks" : `${n} days`)}
                   </button>
@@ -4791,7 +4804,7 @@ useEffect(() => {
                   {/* Archive panel */}
                   {showArchive && archivedProjects.length > 0 && (
                     <div
-                      className={`${isMobile ? "fixed inset-x-2 top-16 z-40" : "fixed right-6 top-24 z-40 w-[340px]"} rounded-2xl border border-zinc-200 bg-white shadow-xl`} data-inbox-panel
+                      className={isMobile ? "fixed inset-x-2 top-14 bottom-2 z-40 rounded-2xl border border-zinc-200 bg-white shadow-xl overflow-auto" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border border-zinc-200 bg-white shadow-xl"}
                       onClick={(e) => e.stopPropagation()}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -4851,10 +4864,11 @@ useEffect(() => {
                     <div key={project.id}>
                       {/* Project header */}
                       <div
-                        className="flex items-center gap-2 border-b px-3 py-2 dm-project-header"
-                        style={{ minWidth: days.length * cellW, borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}
+                        className={`flex items-center ${isMobile ? 'gap-1 px-1 py-1' : 'gap-2 px-3 py-2'} border-b dm-project-header`}
+                        style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}
                       >
-                        {/* Reorder buttons — vertical */}
+                        {/* Reorder buttons — vertical, hidden on mobile */}
+                        {!isMobile && (
                         <div className="flex flex-col flex-shrink-0 gap-0.5">
                           <button
                             className="h-5 w-5 rounded text-center text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100 leading-none text-[10px]"
@@ -4867,6 +4881,7 @@ useEffect(() => {
                             title="Move project down"
                           >▼</button>
                         </div>
+                        )}
                         <button
                           className="flex-shrink-0 w-4 text-center text-zinc-400 hover:text-zinc-700"
                           style={{ transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)", transition: "transform 0.15s", fontSize: 14 }}
@@ -5190,11 +5205,11 @@ useEffect(() => {
 
         {/* ---- ADD TASK MODAL ---- */}
         {addTaskModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setAddTaskModal(false)}>
-            <div className="w-full max-w-md rounded-2xl border bg-white p-4 shadow-xl dm-popover" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }} onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center justify-between mb-3">
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20" onClick={() => setAddTaskModal(false)} style={{ padding: isMobile ? 0 : 16 }}>
+            <div className={isMobile ? "w-full h-full overflow-auto" : "w-full max-w-md max-h-[90vh] overflow-auto rounded-2xl border shadow-xl"} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', padding: 16 }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-3 sticky top-0 z-10 pb-2 -mx-4 px-4 pt-2" style={{ background: darkMode ? '#2c2c2e' : 'white' }}>
                 <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Add task</div>
-                <button className="h-8 w-8 rounded-full border hover:bg-zinc-50 dm-btn" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }} onClick={() => setAddTaskModal(false)}>✕</button>
+                <button className="h-9 w-9 rounded-full border text-lg hover:bg-zinc-50 dm-btn" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }} onClick={() => setAddTaskModal(false)}>✕</button>
               </div>
               <div className="space-y-3">
                 <div>
@@ -5389,7 +5404,7 @@ useEffect(() => {
         {/* ---- GLOBAL INBOX PANEL (all views) ---- */}
         {inboxOpen && (
           <div
-            className={`${isMobile ? "fixed inset-x-2 top-16 z-40" : "fixed right-6 top-24 z-40 w-[340px]"} rounded-2xl border shadow-xl`} data-inbox-panel
+            className={isMobile ? "fixed inset-x-2 top-14 bottom-2 z-40 rounded-2xl border shadow-xl overflow-auto" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border shadow-xl"}
             style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
