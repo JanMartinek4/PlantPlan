@@ -54,7 +54,12 @@ type PlanRecurring = {
   id: string;
   projectId: string;
   title: string;
-  weekday: number; // 0=Sun .. 6=Sat
+  recurrenceType: "weekly" | "everyN" | "biweekly" | "monthlyDate" | "monthlyLast";
+  weekday: number; // 0=Sun .. 6=Sat (used by weekly, biweekly, monthlyLast)
+  everyNDays?: number; // used by everyN
+  startDate?: DayKey; // anchor date for everyN and biweekly
+  monthDay?: number; // 1-31 for monthlyDate
+  skippedDates?: DayKey[]; // specific dates where this recurring task is skipped
 };
 
 type PersistedStateV1 = {
@@ -908,7 +913,7 @@ function LaneRow({
   onUpdateSubTaskTitle: (experimentId: string, subTaskId: string, title: string) => void;
   onDeleteSubTask: (experimentId: string, subTaskId: string) => void;
   onCopyExperiment: (experimentId: string) => void;
-  planRecurringInstances?: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string }>;
+  planRecurringInstances?: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string; recurringId?: string }>;
   onOpenDetail?: (target: DetailTarget) => void;
 }) {
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -1309,16 +1314,18 @@ function AgendaView({
   onOpenDetail,
   onMoveTaskToDay,
   onUpdateTitle,
+  onDeleteRecurring,
 }: {
   days: DayKey[];
   projects: Project[];
-  planRecurringInstances?: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string }>;
+  planRecurringInstances?: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string; recurringId?: string }>;
   darkMode?: boolean;
   completedTasks?: Record<string, boolean>;
   onToggleComplete?: (id: string) => void;
   onOpenDetail?: (target: DetailTarget) => void;
   onMoveTaskToDay?: (taskId: string, projectId: string, itemId: string, kind: "task" | "subtask", newDay: DayKey, experimentId?: string, subTaskId?: string) => void;
   onUpdateTitle?: (projectId: string, itemId: string, title: string, kind: "task" | "subtask", experimentId?: string, subTaskId?: string) => void;
+  onDeleteRecurring?: (recurringId: string, day: DayKey) => void;
 }) {
   const today = todayUTC();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -1340,6 +1347,7 @@ function AgendaView({
         subTaskId?: string;
         expTitle?: string;
         detail?: DetailTarget;
+        recurringId?: string;
       }> = [];
 
       for (const p of projects) {
@@ -1392,6 +1400,7 @@ function AgendaView({
             projectColor: r.color,
             projectId: r.projectId,
             itemId: r.id,
+            recurringId: r.recurringId,
           });
         }
       }
@@ -1557,6 +1566,27 @@ function AgendaView({
                               }}
                               title="Detail"
                             >⋯</button>
+                          )}
+                          {entry.recurringId && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); onDeleteRecurring?.(entry.recurringId!, day); }}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              style={{
+                                flexShrink: 0,
+                                width: 24,
+                                height: 24,
+                                borderRadius: 6,
+                                border: `1px solid ${darkMode ? '#48484a' : '#e4e4e7'}`,
+                                background: darkMode ? '#3a3a3c' : 'white',
+                                color: darkMode ? '#f87171' : '#ef4444',
+                                fontSize: 12,
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                              title="Skip this occurrence"
+                            >✕</button>
                           )}
                         </div>
                         </AgendaDraggable>
@@ -2731,7 +2761,7 @@ function PrintView({
   windowStart: DayKey;
   windowLen: number;
   planRecurring: PlanRecurring[];
-  planRecurringInstances: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string }>;
+  planRecurringInstances: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string; recurringId?: string }>;
 }) {
   const today = todayUTC();
   const firstDay = days[0];
@@ -3012,13 +3042,19 @@ const stored = readStored();
   const [inboxOpen, setInboxOpen] = useState<boolean>(true);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [planRecurringModal, setPlanRecurringModal] = useState(false);
-  const [planRecForm, setPlanRecForm] = useState<{ projectId: string; title: string; weekday: number }>({ projectId: "", title: "", weekday: 1 });
+  const [planRecForm, setPlanRecForm] = useState<{ 
+    projectId: string; title: string; 
+    recurrenceType: "weekly" | "everyN" | "biweekly" | "monthlyDate" | "monthlyLast";
+    weekday: number; everyNDays: number; monthDay: number; 
+  }>({ projectId: "", title: "", recurrenceType: "weekly", weekday: 1, everyNDays: 2, monthDay: 1 });
   const [addTaskModal, setAddTaskModal] = useState(false);
   const [addTaskForm, setAddTaskForm] = useState<{
     projectId: string; title: string; notes: string; day: string; 
     timeEnabled: boolean; startTime: string; endTime: string;
     recurring: boolean; recurringWeekday: number;
-  }>({ projectId: "", title: "", notes: "", day: todayUTC(), timeEnabled: false, startTime: "09:00", endTime: "10:00", recurring: false, recurringWeekday: 1 });
+    recurrenceType: "weekly" | "everyN" | "biweekly" | "monthlyDate" | "monthlyLast";
+    everyNDays: number; monthDay: number;
+  }>({ projectId: "", title: "", notes: "", day: todayUTC(), timeEnabled: false, startTime: "09:00", endTime: "10:00", recurring: false, recurringWeekday: 1, recurrenceType: "weekly", everyNDays: 2, monthDay: 1 });
   const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [newInboxTitle, setNewInboxTitle] = useState<string>("");
 
@@ -3494,14 +3530,40 @@ useEffect(() => {
 
   // Expand planRecurring into per-day virtual task items for plan view display
   const planRecurringInstances = useMemo(() => {
-    const out: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string }> = [];
+    const out: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string; recurringId: string }> = [];
     for (const r of planRecurring) {
       const proj = projects.find((p) => p.id === r.projectId);
       if (!proj) continue;
+      const rType = r.recurrenceType || "weekly"; // backward compat
       for (const day of days) {
         const dt = parseDay(day);
-        if (dt.getUTCDay() === r.weekday) {
-          out.push({ id: `pr:${r.id}:${day}`, title: r.title, day, projectId: r.projectId, color: proj.color });
+        let match = false;
+        if (rType === "weekly") {
+          match = dt.getUTCDay() === r.weekday;
+        } else if (rType === "everyN" && r.everyNDays && r.everyNDays > 0 && r.startDate) {
+          const start = parseDay(r.startDate);
+          const diff = Math.round((dt.getTime() - start.getTime()) / 86400000);
+          match = diff >= 0 && diff % r.everyNDays === 0;
+        } else if (rType === "biweekly" && r.startDate) {
+          // Every 2nd occurrence of this weekday, anchored from startDate
+          if (dt.getUTCDay() === r.weekday) {
+            const start = parseDay(r.startDate);
+            const diff = Math.round((dt.getTime() - start.getTime()) / 86400000);
+            const weeks = Math.floor(diff / 7);
+            match = diff >= 0 && weeks % 2 === 0;
+          }
+        } else if (rType === "monthlyDate" && r.monthDay) {
+          match = dt.getUTCDate() === r.monthDay;
+        } else if (rType === "monthlyLast") {
+          // Last [weekday] of the month
+          if (dt.getUTCDay() === r.weekday) {
+            const lastDay = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth() + 1, 0));
+            const diff = lastDay.getUTCDate() - dt.getUTCDate();
+            match = diff < 7; // within last 7 days = last occurrence
+          }
+        }
+        if (match && !(r.skippedDates ?? []).includes(day)) {
+          out.push({ id: `pr:${r.id}:${day}`, title: r.title, day, projectId: r.projectId, color: proj.color, recurringId: r.id });
         }
       }
     }
@@ -4140,6 +4202,14 @@ useEffect(() => {
   }
 
   function updateItemTitle(projectId: string, itemId: string, title: string) {
+    // If it's a recurring instance, update the recurring rule title
+    if (itemId.startsWith("pr:")) {
+      const ruleId = itemId.split(":").slice(1, -1).join(":");
+      setPlanRecurring((prev) => prev.map((r) => 
+        r.id === ruleId ? { ...r, title } : r
+      ));
+      return;
+    }
     // Find the task's day first (needed for timedEvent sync)
     let taskDay: DayKey | null = null;
     setProjects((prev) => {
@@ -4174,6 +4244,18 @@ useEffect(() => {
   }
 
   function deleteItem(projectId: string, itemId: string) {
+    // If it's a recurring instance (pr:pr_ruleId:2025-03-20), skip this specific date
+    if (itemId.startsWith("pr:")) {
+      // itemId = "pr:pr_xxxx:2025-03-20"
+      const parts = itemId.split(":");
+      const ruleId = parts.slice(1, -1).join(":");
+      const day = parts[parts.length - 1];
+      setPlanRecurring((prev) => prev.map((r) => 
+        r.id === ruleId ? { ...r, skippedDates: [...(r.skippedDates ?? []), day] } : r
+      ));
+      setSelection(null);
+      return;
+    }
     setProjects((prev) => {
       const next = structuredClone(prev) as Project[];
       const pIdx = next.findIndex((p) => p.id === projectId);
@@ -5078,84 +5160,12 @@ useEffect(() => {
                 updateExperimentSubTaskTitle(projectId, experimentId, subTaskId, title);
               }
             }}
+            onDeleteRecurring={(recurringId, day) => {
+              setPlanRecurring((prev) => prev.map((r) => 
+                r.id === recurringId ? { ...r, skippedDates: [...(r.skippedDates ?? []), day] } : r
+              ));
+            }}
           />
-        )}
-
-        {/* ---- PLAN RECURRING MODAL ---- */}
-        {planRecurringModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setPlanRecurringModal(false)}>
-            <div className="w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center justify-between mb-3">
-                <div className="text-sm font-semibold">Recurring task in planner</div>
-                <button className="h-8 w-8 rounded-full border border-zinc-200 bg-white hover:bg-zinc-50" onClick={() => setPlanRecurringModal(false)}>✕</button>
-              </div>
-              <div className="space-y-3">
-                <div>
-                  <div className="mb-1 text-xs text-zinc-600">Project</div>
-                  <select
-                    className="h-9 w-full rounded-lg border border-zinc-200 px-2 text-sm"
-                    value={planRecForm.projectId || projects[0]?.id || ""}
-                    onChange={(e) => setPlanRecForm((p) => ({ ...p, projectId: e.target.value }))}
-                  >
-                    {projects.map((pp) => <option key={pp.id} value={pp.id}>{pp.name}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <div className="mb-1 text-xs text-zinc-600">Task name</div>
-                  <input
-                    className="h-9 w-full rounded-lg border border-zinc-200 px-3 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
-                    placeholder="e.g. Daily journal, Weekly meeting…"
-                    value={planRecForm.title}
-                    onChange={(e) => setPlanRecForm((p) => ({ ...p, title: e.target.value }))}
-                  />
-                </div>
-                <div>
-                  <div className="mb-1 text-xs text-zinc-600">Weekday</div>
-                  <div className="flex gap-1 flex-wrap">
-                    {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => (
-                      <button
-                        key={i}
-                        className={"rounded-lg px-3 py-1.5 text-xs font-medium border " + (planRecForm.weekday === i ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50")}
-                        onClick={() => setPlanRecForm((p) => ({ ...p, weekday: i }))}
-                      >{d}</button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-4 flex items-center justify-between">
-                <div className="text-xs text-zinc-400">Will appear as a badge on each matching day</div>
-                <button
-                  className="h-9 rounded-lg bg-zinc-900 px-4 text-sm font-semibold text-white hover:bg-zinc-800"
-                  onClick={() => {
-                    const pid = planRecForm.projectId || projects[0]?.id;
-                    if (!pid || !planRecForm.title.trim()) return;
-                    setPlanRecurring((prev) => [...prev, { id: `pr_${crypto.randomUUID()}`, projectId: pid, title: planRecForm.title.trim(), weekday: planRecForm.weekday }]);
-                    setPlanRecForm({ projectId: pid, title: "", weekday: planRecForm.weekday });
-                    setPlanRecurringModal(false);
-                  }}
-                >
-                  Add
-                </button>
-              </div>
-              {planRecurring.length > 0 && (
-                <div className="mt-3 border-t border-zinc-100 pt-3 space-y-1">
-                  <div className="text-xs text-zinc-500 mb-1">Existing recurring tasks:</div>
-                  {planRecurring.map((r) => {
-                    const proj = projects.find((p) => p.id === r.projectId);
-                    const days2 = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-                    return (
-                      <div key={r.id} className="flex items-center gap-2 rounded-lg border border-zinc-100 px-2 py-1.5">
-                        <div className="h-2.5 w-2.5 rounded-full flex-shrink-0" style={{ background: proj?.color ?? "#64748b" }} />
-                        <div className="flex-1 text-xs">{r.title}</div>
-                        <div className="text-[10px] text-zinc-400">{days2[r.weekday]}</div>
-                        <button className="text-zinc-300 hover:text-red-400 text-sm" onClick={() => setPlanRecurring((prev) => prev.filter((x) => x.id !== r.id))}>✕</button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
         )}
 
         {/* ---- ADD TASK MODAL ---- */}
@@ -5227,17 +5237,42 @@ useEffect(() => {
                 <div>
                   <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>
                     <input type="checkbox" checked={addTaskForm.recurring} onChange={(e) => setAddTaskForm((p) => ({ ...p, recurring: e.target.checked }))} />
-                    Repeat weekly
+                    Make recurring
                   </label>
                   {addTaskForm.recurring && (
-                    <div className="flex gap-1 flex-wrap mt-1">
-                      {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => (
-                        <button
-                          key={i}
-                          className={"rounded-lg px-3 py-1.5 text-xs font-medium border " + (addTaskForm.recurringWeekday === i ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50")}
-                          onClick={() => setAddTaskForm((p) => ({ ...p, recurringWeekday: i }))}
-                        >{d}</button>
-                      ))}
+                    <div className="mt-2 space-y-2">
+                      <select className="h-8 w-full rounded-lg border px-2 text-xs dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                        value={addTaskForm.recurrenceType} onChange={(e) => setAddTaskForm((p) => ({ ...p, recurrenceType: e.target.value as any }))}>
+                        <option value="weekly">Every week</option>
+                        <option value="biweekly">Every 2 weeks</option>
+                        <option value="everyN">Every N days</option>
+                        <option value="monthlyDate">Monthly (specific date)</option>
+                        <option value="monthlyLast">Monthly (last weekday)</option>
+                      </select>
+                      {(addTaskForm.recurrenceType === "weekly" || addTaskForm.recurrenceType === "biweekly" || addTaskForm.recurrenceType === "monthlyLast") && (
+                        <div className="flex gap-1 flex-wrap">
+                          {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => (
+                            <button key={i}
+                              className={"rounded-lg px-2.5 py-1 text-xs font-medium border " + (addTaskForm.recurringWeekday === i ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50")}
+                              onClick={() => setAddTaskForm((p) => ({ ...p, recurringWeekday: i }))}>{d}</button>
+                          ))}
+                        </div>
+                      )}
+                      {addTaskForm.recurrenceType === "everyN" && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Every</span>
+                          <input type="number" min="1" max="365" className="h-8 w-16 rounded-lg border px-2 text-xs dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                            value={addTaskForm.everyNDays} onChange={(e) => setAddTaskForm((p) => ({ ...p, everyNDays: Math.max(1, parseInt(e.target.value) || 1) }))} />
+                          <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>days</span>
+                        </div>
+                      )}
+                      {addTaskForm.recurrenceType === "monthlyDate" && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Day of month:</span>
+                          <input type="number" min="1" max="31" className="h-8 w-16 rounded-lg border px-2 text-xs dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                            value={addTaskForm.monthDay} onChange={(e) => setAddTaskForm((p) => ({ ...p, monthDay: Math.max(1, Math.min(31, parseInt(e.target.value) || 1)) }))} />
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -5284,10 +5319,16 @@ useEffect(() => {
 
                     // Optionally add recurring
                     if (addTaskForm.recurring) {
-                      setPlanRecurring((prev) => [...prev, { 
-                        id: `pr_${crypto.randomUUID()}`, projectId: pid, 
-                        title: addTaskForm.title.trim(), weekday: addTaskForm.recurringWeekday 
-                      }]);
+                      const newRec: PlanRecurring = {
+                        id: `pr_${crypto.randomUUID()}`, projectId: pid,
+                        title: addTaskForm.title.trim(),
+                        recurrenceType: addTaskForm.recurrenceType,
+                        weekday: addTaskForm.recurringWeekday,
+                        ...(addTaskForm.recurrenceType === "everyN" ? { everyNDays: addTaskForm.everyNDays, startDate: addTaskForm.day } : {}),
+                        ...(addTaskForm.recurrenceType === "biweekly" ? { startDate: addTaskForm.day } : {}),
+                        ...(addTaskForm.recurrenceType === "monthlyDate" ? { monthDay: addTaskForm.monthDay } : {}),
+                      };
+                      setPlanRecurring((prev) => [...prev, newRec]);
                     }
 
                     setAddTaskForm((prev) => ({ ...prev, title: "", notes: "", timeEnabled: false, recurring: false }));
@@ -5297,6 +5338,29 @@ useEffect(() => {
                   Add task
                 </button>
               </div>
+              {planRecurring.length > 0 && (
+                <div className="mt-3 border-t pt-3 space-y-1" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+                  <div className="text-xs mb-1" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>Existing recurring tasks:</div>
+                  {planRecurring.map((r) => {
+                    const proj = projects.find((p) => p.id === r.projectId);
+                    const dayNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+                    const rType = r.recurrenceType || "weekly";
+                    let desc = dayNames[r.weekday] ?? "";
+                    if (rType === "everyN") desc = `every ${r.everyNDays ?? 2} days`;
+                    else if (rType === "biweekly") desc = `biweekly ${dayNames[r.weekday]}`;
+                    else if (rType === "monthlyDate") desc = `${r.monthDay ?? 1}th of month`;
+                    else if (rType === "monthlyLast") desc = `last ${dayNames[r.weekday]}`;
+                    return (
+                      <div key={r.id} className="flex items-center gap-2 rounded-lg border px-2 py-1.5" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+                        <div className="h-2.5 w-2.5 rounded-full flex-shrink-0" style={{ background: proj?.color ?? "#64748b" }} />
+                        <div className="flex-1 text-xs" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>{r.title}</div>
+                        <div className="text-[10px]" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>{desc}</div>
+                        <button className="text-zinc-300 hover:text-red-400 text-sm" onClick={() => setPlanRecurring((prev) => prev.filter((x) => x.id !== r.id))}>✕</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
         )}
