@@ -4812,7 +4812,7 @@ useEffect(() => {
                   {/* Archive panel */}
                   {showArchive && archivedProjects.length > 0 && (
                     <div
-                      className={isMobile ? "fixed inset-x-2 top-14 bottom-2 z-40 rounded-2xl border border-zinc-200 bg-white shadow-xl overflow-auto" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border border-zinc-200 bg-white shadow-xl"}
+                      className={isMobile ? "fixed inset-0 z-50 flex flex-col" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border border-zinc-200 bg-white shadow-xl"}
                       onClick={(e) => e.stopPropagation()}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -5423,21 +5423,21 @@ useEffect(() => {
         {/* ---- GLOBAL INBOX PANEL (all views) ---- */}
         {inboxOpen && (
           <div
-            className={isMobile ? "fixed inset-x-2 top-14 bottom-2 z-40 rounded-2xl border shadow-xl overflow-auto" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border shadow-xl"}
+            className={isMobile ? "fixed inset-0 z-50 flex flex-col" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border shadow-xl"}
             style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b px-3 py-2" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+            <div className="flex items-center justify-between border-b px-3 py-2 flex-shrink-0" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
               <div className="text-sm font-semibold">Inbox</div>
               <button
-                className="h-8 w-8 rounded-full border"
+                className="h-9 w-9 rounded-full border text-lg"
                 style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
                 onClick={() => setInboxOpen(false)}
                 title="Close"
               >✕</button>
             </div>
-            <div className="flex flex-wrap gap-1 border-b p-2" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+            <div className="flex flex-wrap gap-1 border-b p-2 flex-shrink-0" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
               <button className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === "all" ? (darkMode ? "bg-zinc-100 text-zinc-900" : "bg-zinc-900 text-white") : "")} style={inboxFilter !== "all" ? { background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#3f3f46', border: '1px solid' } : {}} onClick={() => setInboxFilter("all")}>All</button>
               {projects.map((pp) => (
                 <button key={pp.id} className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === pp.id ? (darkMode ? "bg-zinc-100 text-zinc-900" : "bg-zinc-900 text-white") : "")} style={inboxFilter !== pp.id ? { background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#3f3f46', border: '1px solid' } : {}} onClick={() => setInboxFilter(pp.id)}>
@@ -5446,6 +5446,7 @@ useEffect(() => {
               ))}
               <button className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === "completed" ? (darkMode ? "bg-zinc-100 text-zinc-900" : "bg-zinc-900 text-white") : "")} style={inboxFilter !== "completed" ? { background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#3f3f46', border: '1px solid' } : {}} onClick={() => setInboxFilter("completed")}>Completed</button>
             </div>
+            <div className="flex-1 overflow-auto">
             {inboxFilter !== "completed" && (
               <div className="border-b p-2" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
                 <div className="flex gap-2">
