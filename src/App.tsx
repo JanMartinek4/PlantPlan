@@ -429,7 +429,6 @@ function DroppableCell({
         width,
         background: isToday ? 'var(--today-bg)' : isWeekend ? 'var(--weekend-bg)' : 'var(--cell-bg)',
         borderColor: 'var(--cell-border)',
-        touchAction: 'none',
       }}
       className={
         "relative h-20 border-b border-r " +
@@ -972,13 +971,21 @@ function LaneRow({
                 if (e.target !== e.currentTarget) return;
                 if (e.button !== 0) return;
                 if (resizeExp) return;
-                (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                // Don't capture pointer immediately on touch — let scroll happen
+                // Capture will happen on first horizontal move in onPointerMove
+                if (e.pointerType !== 'touch') {
+                  (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                }
                 onStartRange(d, e.pointerId);
               }}
               onPointerMove={(e) => {
                 if (!dragCreate) return;
                 if (dragCreate.projectId !== project.id || dragCreate.laneId !== lane.id) return;
                 if (dragCreate.pointerId !== e.pointerId) return;
+                // On touch: capture pointer on first horizontal move (user is dragging to create, not scrolling)
+                if (e.pointerType === 'touch' && !dragCreate.moved) {
+                  try { (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId); } catch {}
+                }
                 const rect = gridRef.current?.getBoundingClientRect();
                 if (!rect) return;
                 const x = e.clientX - rect.left;
@@ -3052,7 +3059,7 @@ const stored = readStored();
   const [archivedProjects, setArchivedProjects] = useState<Project[]>(() => (stored as any)?.archivedProjects ?? []);
   const [showArchive, setShowArchive] = useState<boolean>(false);
   const [closeConfirm, setCloseConfirm] = useState<string | null>(null); // projectId awaiting confirm
-  const [inboxOpen, setInboxOpen] = useState<boolean>(true);
+  const [inboxOpen, setInboxOpen] = useState<boolean>(() => typeof window !== 'undefined' && window.innerWidth >= 768);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [planRecurringModal, setPlanRecurringModal] = useState(false);
   const [planRecForm, setPlanRecForm] = useState<{ 
@@ -3061,6 +3068,7 @@ const stored = readStored();
     weekday: number; everyNDays: number; monthDay: number; 
   }>({ projectId: "", title: "", recurrenceType: "weekly", weekday: 1, everyNDays: 2, monthDay: 1 });
   const [addTaskModal, setAddTaskModal] = useState(false);
+  const [showRecurringList, setShowRecurringList] = useState(false);
   const [addTaskForm, setAddTaskForm] = useState<{
     projectId: string; title: string; notes: string; day: string; 
     timeEnabled: boolean; startTime: string; endTime: string;
@@ -5374,8 +5382,17 @@ useEffect(() => {
                 </button>
               </div>
               {planRecurring.length > 0 && (
-                <div className="mt-3 border-t pt-3 space-y-1" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
-                  <div className="text-xs mb-1" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>Existing recurring tasks:</div>
+                <div className="mt-3 border-t pt-3" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+                  <button 
+                    className="text-xs mb-1 flex items-center gap-1 cursor-pointer" 
+                    style={{ color: darkMode ? '#636366' : '#a1a1aa', background: 'none', border: 'none', padding: 0 }}
+                    onClick={() => setShowRecurringList((v) => !v)}
+                  >
+                    <span style={{ display: 'inline-block', transform: showRecurringList ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s', fontSize: 10 }}>▶</span>
+                    Existing recurring tasks ({planRecurring.length})
+                  </button>
+                  {showRecurringList && (
+                    <div className="space-y-1 mt-1">
                   {planRecurring.map((r) => {
                     const proj = projects.find((p) => p.id === r.projectId);
                     const dayNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
@@ -5394,6 +5411,8 @@ useEffect(() => {
                       </div>
                     );
                   })}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
