@@ -4791,7 +4791,7 @@ useEffect(() => {
                   {/* Archive panel */}
                   {showArchive && archivedProjects.length > 0 && (
                     <div
-                      className={isMobile ? "fixed inset-x-2 top-16 z-40 rounded-2xl" : "fixed right-6 top-24 z-40 w-[340px]"} data-inbox-panel rounded-2xl border border-zinc-200 bg-white shadow-xl"
+                      className={`${isMobile ? "fixed inset-x-2 top-16 z-40" : "fixed right-6 top-24 z-40 w-[340px]"} rounded-2xl border border-zinc-200 bg-white shadow-xl`} data-inbox-panel
                       onClick={(e) => e.stopPropagation()}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -5389,7 +5389,7 @@ useEffect(() => {
         {/* ---- GLOBAL INBOX PANEL (all views) ---- */}
         {inboxOpen && (
           <div
-            className={isMobile ? "fixed inset-x-2 top-16 z-40 rounded-2xl" : "fixed right-6 top-24 z-40 w-[340px]"} data-inbox-panel rounded-2xl border shadow-xl"
+            className={`${isMobile ? "fixed inset-x-2 top-16 z-40" : "fixed right-6 top-24 z-40 w-[340px]"} rounded-2xl border shadow-xl`} data-inbox-panel
             style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
