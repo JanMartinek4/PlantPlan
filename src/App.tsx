@@ -3020,8 +3020,12 @@ const stored = readStored();
 
   // Mobile detection
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
+  const [isLandscape, setIsLandscape] = useState(() => typeof window !== 'undefined' && window.innerWidth > window.innerHeight);
   useEffect(() => {
-    const check = () => setIsMobile(window.innerWidth < 768);
+    const check = () => {
+      setIsMobile(window.innerWidth < 768);
+      setIsLandscape(window.innerWidth > window.innerHeight);
+    };
     window.addEventListener('resize', check);
     return () => window.removeEventListener('resize', check);
   }, []);
@@ -4627,7 +4631,40 @@ useEffect(() => {
         <div className={isMobile ? "sticky top-0 z-50 pb-1" : "sticky top-0 z-50 pb-4"} style={{ background: darkMode ? '#1c1c1e' : '#fafafa' }}>
           {isMobile ? (
           <div data-print-hide>
-            {/* Mobile row 1: View toggle + Navigation */}
+            {isLandscape ? (
+            /* Mobile landscape: single row */
+            <div className="flex items-center gap-1 flex-wrap">
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                {(["plan", "calendar", "agenda"] as const).map((v) => (
+                  <button key={v} className="rounded-lg px-2 py-1 text-xs hover:opacity-80"
+                    style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}</button>
+                ))}
+              </div>
+              <div className="flex items-center gap-0.5">
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀◀</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
+                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶▶</button>
+              </div>
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                {([5, 7, 14, 28] as const).map((n) => (
+                  <button key={n} className="rounded-lg px-1.5 py-1 text-xs hover:opacity-80"
+                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    onClick={() => setWindowLen(n as any)}>{n}</button>
+                ))}
+              </div>
+              <button className="rounded-xl border px-2.5 py-1 text-xs font-semibold shadow-sm" style={{ background: '#2563eb', color: 'white', borderColor: '#1d4ed8' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>📥</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀️" : "🌙"}</button>
+              {archivedProjects.length > 0 && (
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
+              )}
+            </div>
+            ) : (
+            /* Mobile portrait: two rows */
+            <>
             <div className="flex items-center gap-1 mb-1">
               <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
                 {(["plan", "calendar", "agenda"] as const).map((v) => (
@@ -4644,7 +4681,6 @@ useEffect(() => {
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶▶</button>
               </div>
             </div>
-            {/* Mobile row 2: Days toggle + actions */}
             <div className="flex items-center gap-1">
               <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
                 {([5, 7, 14, 28] as const).map((n) => (
@@ -4660,6 +4696,8 @@ useEffect(() => {
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
               )}
             </div>
+            </>
+            )}
             <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.currentTarget.value = ""; }} />
           </div>
           ) : (
