@@ -4625,77 +4625,83 @@ useEffect(() => {
       <div className="mx-auto flex h-full max-w-[1500px] flex-col">
         {/* Sticky top bar */}
         <div className={isMobile ? "sticky top-0 z-50 pb-1" : "sticky top-0 z-50 pb-4"} style={{ background: darkMode ? '#1c1c1e' : '#fafafa' }}>
+          {isMobile ? (
+          <div data-print-hide>
+            {/* Mobile row 1: View toggle + Navigation */}
+            <div className="flex items-center gap-1 mb-1">
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                {(["plan", "calendar", "agenda"] as const).map((v) => (
+                  <button key={v} className="rounded-lg px-2 py-1 text-xs hover:opacity-80"
+                    style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}</button>
+                ))}
+              </div>
+              <div className="flex items-center gap-0.5">
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀◀</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
+                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶▶</button>
+              </div>
+            </div>
+            {/* Mobile row 2: Days toggle + actions */}
+            <div className="flex items-center gap-1">
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                {([5, 7, 14, 28] as const).map((n) => (
+                  <button key={n} className="rounded-lg px-1.5 py-1 text-xs hover:opacity-80"
+                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    onClick={() => setWindowLen(n as any)}>{n}</button>
+                ))}
+              </div>
+              <button className="rounded-xl border px-2.5 py-1 text-xs font-semibold shadow-sm" style={{ background: '#2563eb', color: 'white', borderColor: '#1d4ed8' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>📥</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀️" : "🌙"}</button>
+              {archivedProjects.length > 0 && (
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
+              )}
+            </div>
+            <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.currentTarget.value = ""; }} />
+          </div>
+          ) : (
           <div className="flex items-center gap-1.5 flex-wrap" data-print-hide>
-              {/* View mode toggle */}
+              {/* Desktop: View mode toggle */}
               <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
                 {(["plan", "calendar", "agenda"] as const).map((v) => (
-                  <button
-                    key={v}
-                    className={isMobile ? "rounded-lg px-2 py-1 text-xs hover:opacity-80" : "rounded-lg px-3 py-1.5 text-sm hover:opacity-80"}
+                  <button key={v} className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
                     style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                    onClick={() => setViewMode(v)}
-                  >
-                    {v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}
-                  </button>
+                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Calendar" : "Agenda"}</button>
                 ))}
               </div>
-
-              {/* Navigation */}
+              {/* Desktop: Navigation */}
               <div className="flex items-center gap-0.5">
-                <button className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{isMobile ? "◀◀" : `◀︎ -${windowLen}`}</button>
-                <button className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
-                <button className={`rounded-xl border ${isMobile ? 'px-2 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => {
-                  const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2;
-                  setWindowStart(() => addDays(todayUTC(), offset));
-                }}>Today</button>
-                <button className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
-                <button className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{isMobile ? "▶▶" : `+${windowLen} ▶︎`}</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{`◀︎ -${windowLen}`}</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{`+${windowLen} ▶︎`}</button>
               </div>
-
-              {/* Window length toggle */}
+              {/* Desktop: Window length toggle */}
               <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-                {(isMobile ? [5, 7, 14, 28] as const : [7, 14, 28] as const).map((n) => (
-                  <button
-                    key={n}
-                    className={isMobile ? "rounded-lg px-1.5 py-1 text-xs hover:opacity-80" : "rounded-lg px-3 py-1.5 text-sm hover:opacity-80"}
+                {([7, 14, 28] as const).map((n) => (
+                  <button key={n} className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
                     style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
-                    onClick={() => setWindowLen(n as any)}
-                  >
-                    {isMobile ? n : (n === 28 ? "4 weeks" : `${n} days`)}
-                  </button>
+                    onClick={() => setWindowLen(n)}>{n === 28 ? "4 weeks" : `${n} days`}</button>
                 ))}
               </div>
-
-              {/* Actions */}
-              <button className={`rounded-xl border ${isMobile ? 'px-2.5 py-1 text-xs' : 'px-4 py-2 text-sm'} font-semibold shadow-sm`} style={{ background: darkMode ? '#3b82f6' : '#2563eb', color: 'white', borderColor: darkMode ? '#2563eb' : '#1d4ed8' }} onClick={() => {
-                if (projects.length === 0) addProject();
-                setAddTaskModal(true);
-              }}>+ Task</button>
-              {!isMobile && <>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => fileInputRef.current?.click()}>Import</button>
-              </>}
+              {/* Desktop: Actions */}
+              <button className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm" style={{ background: darkMode ? '#3b82f6' : '#2563eb', color: 'white', borderColor: darkMode ? '#2563eb' : '#1d4ed8' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => fileInputRef.current?.click()}>Import</button>
               <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.currentTarget.value = ""; }} />
-              <button className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>{isMobile ? "📥" : "Inbox"}</button>
-              <button className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)} title={darkMode ? "Light mode" : "Dark mode"}>{darkMode ? "☀️" : "🌙"}</button>
-              {/* Autosave indicator — hidden on mobile */}
-              {!isMobile && savedAt && (
-                <span className="text-xs" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>
-                  saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                </span>
-              )}
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>Inbox</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)} title={darkMode ? "Light mode" : "Dark mode"}>{darkMode ? "☀️" : "🌙"}</button>
+              {savedAt && (<span className="text-xs" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>)}
               {archivedProjects.length > 0 && (
-                <button
-                  className={`rounded-xl border ${isMobile ? 'px-1.5 py-1 text-xs' : 'px-3 py-2 text-sm'} shadow-sm dm-btn`}
-                  style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }}
-                  onClick={() => setShowArchive((v) => !v)}
-                  title="Archived projects"
-                >
-                  {isMobile ? "📦" : `Archive (${archivedProjects.length})`}
-                </button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)} title="Archived projects">{`Archive (${archivedProjects.length})`}</button>
               )}
           </div>
+          )}
 
           {/* Date header strip — now inside plan view scroll container */}
         </div>
