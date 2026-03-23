@@ -453,6 +453,7 @@ function Segment({
   projectId,
   laneId,
   onSetDetailTarget,
+  onMakeRecurring,
 }: {
   item: LaneItem;
   color: string;
@@ -466,6 +467,7 @@ function Segment({
   projectId?: string;
   laneId?: string;
   onSetDetailTarget?: (t: DetailTarget) => void;
+  onMakeRecurring?: () => void;
 }) {
   const bg = item.type === "task" ? color : color + "22";
   const border = item.type === "task" ? "transparent" : color;
@@ -588,6 +590,13 @@ function Segment({
             >
               📝 Detail
             </button>
+            {onMakeRecurring && (
+              <button
+                className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+                onClick={(e) => { e.stopPropagation(); commitTitle(); onMakeRecurring(); onClose?.(); }}
+                title="Make this task recurring"
+              >↻</button>
+            )}
             <div className="flex gap-2">
             <button
               className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
@@ -1084,6 +1093,15 @@ function LaneRow({
                         projectId={project.id}
                         laneId={lane.id}
                         onSetDetailTarget={(t) => onOpenDetail?.(t!)}
+                        onMakeRecurring={it.type === "task" ? () => {
+                          const isRecInstance = it.id.startsWith("pr:");
+                          if (isRecInstance) {
+                            const ruleId = it.id.split(":").slice(1, -1).join(":");
+                            window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: project.id, title: it.title, recurringId: ruleId } }));
+                          } else {
+                            window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: project.id, title: it.title } }));
+                          }
+                        } : undefined}
                       />
 
                       {it.type === "experiment" && (
@@ -1906,6 +1924,24 @@ function CalendarView({
                 }}
                 title="Notes & checklist"
               >📝 Detail</button>
+              {task.meta && (
+              <button
+                className="h-7 rounded-lg border px-2 text-xs hover:bg-zinc-50"
+                style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b', background: darkMode ? '#3a3a3c' : 'white' }}
+                onClick={() => {
+                  commitTitle();
+                  const m = task.meta as any;
+                  if (m?.isPlanRecurring && ev.id.startsWith("pr:")) {
+                    const ruleId = ev.id.split(":").slice(1, -1).join(":");
+                    window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: m.projectId || task.color, title: task.title.replace(/^↻ /, ""), recurringId: ruleId } }));
+                  } else if (m?.projectId) {
+                    window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: m.projectId, title: task.title } }));
+                  }
+                  setSelectedEvtId(null);
+                }}
+                title={task.meta && (task.meta as any).isPlanRecurring ? "Edit recurrence" : "Make recurring"}
+              >↻</button>
+              )}
               <button
                 className="h-7 rounded-lg border px-2 text-xs hover:bg-zinc-50"
                 style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b', background: darkMode ? '#3a3a3c' : 'white' }}
@@ -2117,14 +2153,6 @@ function CalendarView({
       <div className="flex items-center justify-between p-4 pb-0 flex-shrink-0">
         <div className="flex items-center gap-2">
           <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Calendar</div>
-          <button
-            className="rounded-lg border px-2 py-1 text-xs shadow-sm"
-            style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
-            onClick={() => openNewRecurring()}
-            title="Add recurring block"
-          >
-            + recurring
-          </button>
         </div>
         <div className="flex items-center gap-2">
           <div className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Days:</div>
@@ -3073,6 +3101,11 @@ const stored = readStored();
   }>({ projectId: "", title: "", recurrenceType: "weekly", weekday: 1, everyNDays: 2, monthDay: 1 });
   const [addTaskModal, setAddTaskModal] = useState(false);
   const [showRecurringList, setShowRecurringList] = useState(false);
+  const [editRecurringId, setEditRecurringId] = useState<string | null>(null);
+  const [editRecForm, setEditRecForm] = useState<{
+    recurrenceType: "weekly" | "everyN" | "biweekly" | "monthlyDate" | "monthlyLast";
+    weekday: number; everyNDays: number; monthDay: number; title: string;
+  }>({ recurrenceType: "weekly", weekday: 1, everyNDays: 2, monthDay: 1, title: "" });
   const [addTaskForm, setAddTaskForm] = useState<{
     projectId: string; title: string; notes: string; day: string; 
     timeEnabled: boolean; startTime: string; endTime: string;
@@ -3621,7 +3654,13 @@ useEffect(() => {
 
   const inboxTasks = useMemo(() => {
     const visible = taskCatalog.filter((t) => calDays.includes(t.day));
-    return visible.filter((t) => !timedEvents[t.id]);
+    return visible.filter((t) => {
+      const ev = timedEvents[t.id];
+      if (!ev) return true;
+      if (!calDays.includes(ev.day)) return true;
+      if (!ev.startMin && !ev.endMin) return true;
+      return false;
+    });
   }, [taskCatalog, timedEvents, calDays]);
 
   const eventsForCal = useMemo(() => {
@@ -4453,6 +4492,29 @@ useEffect(() => {
     return () => window.removeEventListener("cal-delete-task", handler);
   }, []);
 
+  // Listen for make-recurring events from Segment/EventBox popover
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { projectId, title, recurringId } = (e as CustomEvent).detail;
+      if (recurringId) {
+        const rule = planRecurring.find((r) => r.id === recurringId);
+        if (rule) {
+          setEditRecForm({
+            recurrenceType: rule.recurrenceType || "weekly",
+            weekday: rule.weekday, everyNDays: rule.everyNDays ?? 2,
+            monthDay: rule.monthDay ?? 1, title: rule.title,
+          });
+          setEditRecurringId(rule.id);
+        }
+      } else if (projectId && title) {
+        setAddTaskForm((prev) => ({ ...prev, projectId, title, recurring: true, recurrenceType: "weekly", recurringWeekday: 1 }));
+        setAddTaskModal(true);
+      }
+    };
+    window.addEventListener("make-recurring", handler);
+    return () => window.removeEventListener("make-recurring", handler);
+  }, [planRecurring]);
+
   useEffect(() => {
     if (!resizeExp) return;
     const pid = resizeExp.pointerId;
@@ -5230,6 +5292,82 @@ useEffect(() => {
             }}
           />
         )}
+
+        {/* ---- EDIT RECURRING MODAL ---- */}
+        {editRecurringId && (() => {
+          const rule = planRecurring.find((r) => r.id === editRecurringId);
+          if (!rule) return null;
+          const proj = projects.find((p) => p.id === rule.projectId);
+          return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setEditRecurringId(null)}>
+            <div className="w-full max-w-sm rounded-2xl border shadow-xl p-4" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Edit recurrence</div>
+                <button className="h-8 w-8 rounded-full border text-lg" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }} onClick={() => setEditRecurringId(null)}>✕</button>
+              </div>
+              <div className="space-y-3">
+                <div>
+                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Task</div>
+                  <div className="flex items-center gap-2">
+                    <div className="h-3 w-3 rounded-full" style={{ background: proj?.color ?? '#64748b' }} />
+                    <input className="h-9 flex-1 rounded-lg border px-3 text-sm outline-none" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      value={editRecForm.title} onChange={(e) => setEditRecForm((p) => ({ ...p, title: e.target.value }))} />
+                  </div>
+                </div>
+                <div>
+                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Repeat</div>
+                  <select className="h-9 w-full rounded-lg border px-2 text-sm" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    value={editRecForm.recurrenceType} onChange={(e) => setEditRecForm((p) => ({ ...p, recurrenceType: e.target.value as any }))}>
+                    <option value="weekly">Every week</option>
+                    <option value="biweekly">Every 2 weeks</option>
+                    <option value="everyN">Every N days</option>
+                    <option value="monthlyDate">Monthly (specific date)</option>
+                    <option value="monthlyLast">Monthly (last weekday)</option>
+                  </select>
+                </div>
+                {(editRecForm.recurrenceType === "weekly" || editRecForm.recurrenceType === "biweekly" || editRecForm.recurrenceType === "monthlyLast") && (
+                  <div className="flex gap-1 flex-wrap">
+                    {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d, i) => (
+                      <button key={i} className={"rounded-lg px-2.5 py-1 text-xs font-medium border " + (editRecForm.weekday === i ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50")}
+                        onClick={() => setEditRecForm((p) => ({ ...p, weekday: i }))}>{d}</button>
+                    ))}
+                  </div>
+                )}
+                {editRecForm.recurrenceType === "everyN" && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Every</span>
+                    <input type="number" min="1" max="365" className="h-8 w-16 rounded-lg border px-2 text-xs" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      value={editRecForm.everyNDays} onChange={(e) => setEditRecForm((p) => ({ ...p, everyNDays: Math.max(1, parseInt(e.target.value) || 1) }))} />
+                    <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>days</span>
+                  </div>
+                )}
+                {editRecForm.recurrenceType === "monthlyDate" && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Day of month:</span>
+                    <input type="number" min="1" max="31" className="h-8 w-16 rounded-lg border px-2 text-xs" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      value={editRecForm.monthDay} onChange={(e) => setEditRecForm((p) => ({ ...p, monthDay: Math.max(1, Math.min(31, parseInt(e.target.value) || 1)) }))} />
+                  </div>
+                )}
+              </div>
+              <div className="mt-4 flex items-center justify-between">
+                <button className="h-8 rounded-lg border px-3 text-xs text-red-500 hover:bg-red-50" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', background: darkMode ? '#3a3a3c' : 'white' }}
+                  onClick={() => { setPlanRecurring((prev) => prev.filter((r) => r.id !== editRecurringId)); setEditRecurringId(null); }}>Delete rule</button>
+                <button className="h-8 rounded-lg bg-zinc-900 px-4 text-xs font-semibold text-white hover:bg-zinc-800"
+                  onClick={() => {
+                    setPlanRecurring((prev) => prev.map((r) => r.id === editRecurringId ? {
+                      ...r, title: editRecForm.title.trim() || r.title,
+                      recurrenceType: editRecForm.recurrenceType, weekday: editRecForm.weekday,
+                      ...(editRecForm.recurrenceType === "everyN" ? { everyNDays: editRecForm.everyNDays, startDate: r.startDate || todayUTC() } : {}),
+                      ...(editRecForm.recurrenceType === "monthlyDate" ? { monthDay: editRecForm.monthDay } : {}),
+                      ...(editRecForm.recurrenceType === "biweekly" ? { startDate: r.startDate || todayUTC() } : {}),
+                    } : r));
+                    setEditRecurringId(null);
+                  }}>Save</button>
+              </div>
+            </div>
+          </div>
+          );
+        })()}
 
         {/* ---- ADD TASK MODAL ---- */}
         {addTaskModal && (
