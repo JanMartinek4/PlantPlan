@@ -1020,11 +1020,13 @@ function LinkArrows({
     const h = box.scrollHeight;
     const colW = w / Math.max(1, days.length);
 
+    // Box of an item on screen, or a point at its project's header when it is not shown
     const anchor = (itemId: string, side: "out" | "in") => {
       const el = box.querySelector(`[data-item-id="${CSS.escape(itemId)}"]`);
       if (el) {
         const r = el.getBoundingClientRect();
-        return { x: (side === "out" ? r.right : r.left) - br.left, y: r.top - br.top + r.height / 2, isItem: true };
+        const t = r.top - br.top;
+        return { l: r.left - br.left, r: r.right - br.left, t, b: t + r.height, cy: t + r.height / 2, isItem: true };
       }
       for (const proj of projects) {
         const item = proj.lanes.flatMap((l) => l.items).find((it) => it.id === itemId);
@@ -1034,7 +1036,8 @@ function LinkArrows({
         const hr = header.getBoundingClientRect();
         const day = side === "out" ? item.end : item.start;
         const x = Math.max(6, Math.min(w - 6, (diffDays(days[0], day) + (side === "out" ? 1 : 0)) * colW));
-        return { x, y: hr.top - br.top + hr.height / 2, isItem: false };
+        const cy = hr.top - br.top + hr.height / 2;
+        return { l: x, r: x, t: cy, b: cy, cy, isItem: false };
       }
       return null;
     };
@@ -1045,22 +1048,39 @@ function LinkArrows({
       const b = anchor(l.to, "in");
       if (!a || !b || (!a.isItem && !b.isItem)) continue; // nothing of it on screen
       const color = projects.find((pr) => pr.lanes.some((ln) => ln.items.some((it) => it.id === l.from)))?.color ?? "#64748b";
-      const x2 = b.isItem ? b.x - 2 : b.x;
-      // forward: smooth S-curve; backward (target earlier): a small loop instead of a huge swing
-      const dx = x2 >= a.x ? Math.max(30, (x2 - a.x) / 2) : 50;
-      const c1: [number, number] = [a.x + dx, a.y];
-      const c2: [number, number] = [x2 - dx, b.y];
+
+      // Always ends in the target's left edge; where it starts depends on where the target is
+      const ex = b.isItem ? b.l - 2 : b.l;
+      const ey = b.cy;
+      let start: [number, number];
+      let c1: [number, number];
+      let c2: [number, number];
+      const sameRow = Math.abs(ey - a.cy) < Math.max(12, (a.b - a.t) / 2);
+      if (sameRow || !a.isItem) {
+        // Same row: out of the right edge, smooth S-curve (a small loop when the target is earlier)
+        start = [a.r, a.cy];
+        const dx = ex >= a.r ? Math.max(30, (ex - a.r) / 2) : 50;
+        c1 = [a.r + dx, a.cy];
+        c2 = [ex - dx, ey];
+      } else {
+        // Another row: out of the bottom-right (or top-right) corner, down/up, then round into the target
+        const sx = a.r - Math.min(12, (a.r - a.l) / 4);
+        const sy = ey > a.cy ? a.b : a.t;
+        start = [sx, sy];
+        c1 = [sx, ey];
+        c2 = ex >= sx + 8 ? [sx + (ex - sx) * 0.3, ey] : [ex - 40, ey];
+      }
       const mid: [number, number] = [
-        0.125 * a.x + 0.375 * c1[0] + 0.375 * c2[0] + 0.125 * x2,
-        0.125 * a.y + 0.375 * c1[1] + 0.375 * c2[1] + 0.125 * b.y,
+        0.125 * start[0] + 0.375 * c1[0] + 0.375 * c2[0] + 0.125 * ex,
+        0.125 * start[1] + 0.375 * c1[1] + 0.375 * c2[1] + 0.125 * ey,
       ];
       arrows.push({
         id: l.id,
-        d: `M ${a.x} ${a.y} C ${c1[0]} ${c1[1]}, ${c2[0]} ${c2[1]}, ${x2} ${b.y}`,
+        d: `M ${start[0]} ${start[1]} C ${c1[0]} ${c1[1]}, ${c2[0]} ${c2[1]}, ${ex} ${ey}`,
         color,
-        start: [a.x, a.y],
+        start,
         startIsItem: a.isItem,
-        end: [x2, b.y],
+        end: [ex, ey],
         endIsItem: b.isItem,
         mid,
       });
