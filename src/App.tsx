@@ -740,6 +740,8 @@ function SubTaskPill({
   onUpdateTitle,
   onClose,
   onOpenDetail,
+  anchorId,
+  onStartLink,
 }: {
   text: string;
   color: string;
@@ -749,6 +751,8 @@ function SubTaskPill({
   onUpdateTitle?: (t: string) => void;
   onClose?: () => void;
   onOpenDetail?: () => void;
+  anchorId?: string; // sub-task id on the pill shown in the plan (arrow anchor)
+  onStartLink?: () => void;
 }) {
   const [draft, setDraft] = useState(text);
   const subTitleRef = useRef<HTMLInputElement | null>(null);
@@ -777,6 +781,7 @@ function SubTaskPill({
           (selected ? "ring-2 ring-zinc-900/30" : "")
         }
         style={{ background: color }}
+        data-item-id={anchorId}
         onClick={(e) => { e.stopPropagation(); onSelect?.(); }}
         title={text}
       >
@@ -824,6 +829,13 @@ function SubTaskPill({
             >
               <Icon name="note" size={12} /> Detail
             </button>
+            {onStartLink && (
+              <button
+                className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+                onClick={() => { commit(); onStartLink(); }}
+                title="Draw an arrow to another task or experiment"
+              >→</button>
+            )}
             <div className="flex gap-2">
             <button
               className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
@@ -1010,15 +1022,29 @@ function LinkArrows({
   onDelete: (id: string) => void;
 }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const [shape, setShape] = useState<{ w: number; h: number; arrows: ArrowShape[] }>({ w: 0, h: 0, arrows: [] });
+  const [shape, setShape] = useState<{ w: number; arrows: ArrowShape[] }>({ w: 0, arrows: [] });
 
   const measure = () => {
     const box = svgRef.current?.parentElement;
     if (!box) return;
     const br = box.getBoundingClientRect();
-    const w = box.scrollWidth;
-    const h = box.scrollHeight;
+    // Width of the day grid (from the date header) – not the box itself, which the arrows must not stretch
+    const w = (box.querySelector("[data-date-header]") as HTMLElement | null)?.offsetWidth ?? box.clientWidth;
     const colW = w / Math.max(1, days.length);
+
+    // Where an item or a sub-task lives in the data
+    const locate = (id: string) => {
+      for (const proj of projects) {
+        for (const it of proj.lanes.flatMap((l) => l.items)) {
+          if (it.id === id) return { proj, start: it.start, end: it.end, expId: null as string | null };
+          if (it.type !== "experiment") continue;
+          for (const [day, arr] of Object.entries(it.subTasks)) {
+            if (arr.some((st) => st.id === id)) return { proj, start: day, end: day, expId: it.id };
+          }
+        }
+      }
+      return null;
+    };
 
     // Box of an item on screen, or a point at its project's header when it is not shown
     const anchor = (itemId: string, side: "out" | "in") => {
@@ -1028,13 +1054,19 @@ function LinkArrows({
         const t = r.top - br.top;
         return { l: r.left - br.left, r: r.right - br.left, t, b: t + r.height, cy: t + r.height / 2, isItem: true };
       }
-      for (const proj of projects) {
-        const item = proj.lanes.flatMap((l) => l.items).find((it) => it.id === itemId);
-        if (!item) continue;
-        const header = box.querySelector(`[data-project-id="${CSS.escape(proj.id)}"]`);
+      const found = locate(itemId);
+      if (found) {
+        // A sub-task hidden behind "+N": point at its experiment
+        const expEl = found.expId ? box.querySelector(`[data-item-id="${CSS.escape(found.expId)}"]`) : null;
+        if (expEl) {
+          const r = expEl.getBoundingClientRect();
+          const t = r.top - br.top;
+          return { l: r.left - br.left, r: r.right - br.left, t, b: t + r.height, cy: t + r.height / 2, isItem: true };
+        }
+        const header = box.querySelector(`[data-project-id="${CSS.escape(found.proj.id)}"]`);
         if (!header) return null;
         const hr = header.getBoundingClientRect();
-        const day = side === "out" ? item.end : item.start;
+        const day = side === "out" ? found.end : found.start;
         const x = Math.max(6, Math.min(w - 6, (diffDays(days[0], day) + (side === "out" ? 1 : 0)) * colW));
         const cy = hr.top - br.top + hr.height / 2;
         return { l: x, r: x, t: cy, b: cy, cy, isItem: false };
@@ -1047,7 +1079,7 @@ function LinkArrows({
       const a = anchor(l.from, "out");
       const b = anchor(l.to, "in");
       if (!a || !b || (!a.isItem && !b.isItem)) continue; // nothing of it on screen
-      const color = projects.find((pr) => pr.lanes.some((ln) => ln.items.some((it) => it.id === l.from)))?.color ?? "#64748b";
+      const color = locate(l.from)?.proj.color ?? "#64748b";
 
       // Always ends in the target's left edge; where it starts depends on where the target is
       const ex = b.isItem ? b.l - 2 : b.l;
@@ -1085,7 +1117,7 @@ function LinkArrows({
         mid,
       });
     }
-    const next = { w, h, arrows };
+    const next = { w, arrows };
     setShape((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
   };
 
@@ -1105,7 +1137,7 @@ function LinkArrows({
       <svg
         ref={svgRef}
         className="pointer-events-none absolute left-0 top-0"
-        style={{ width: shape.w, height: shape.h, zIndex: 15, overflow: "visible" }}
+        style={{ width: 1, height: 1, zIndex: 15, overflow: "visible" }} // zero-size layer: draws over the plan without changing its size
       >
         {shape.arrows.map((a) => (
           <g key={a.id}>
@@ -1552,6 +1584,8 @@ function LaneRow({
                               onUpdateTitle={(title) => onUpdateSubTaskTitle(exp.id, t.id, title)}
                               onDelete={() => onDeleteSubTask(exp.id, t.id)}
                               onOpenDetail={() => onOpenDetail?.({ kind: "subtask", projectId: project.id, laneId: lane.id, experimentId: exp.id, subTaskId: t.id, day })}
+                              anchorId={t.id}
+                              onStartLink={onStartLink && (() => onStartLink(t.id))}
                             />
                           </div>
                         </Draggable>
@@ -1603,6 +1637,7 @@ function LaneRow({
                                 onDelete={() => onDeleteSubTask(exp.id, tt.id)}
                                 onClose={() => onClearSelection()}
                                 onOpenDetail={() => onOpenDetail?.({ kind: "subtask", projectId: project.id, laneId: lane.id, experimentId: exp.id, subTaskId: tt.id, day })}
+                                onStartLink={onStartLink && (() => onStartLink(tt.id))}
                               />
                             </div>
                           ))}
@@ -4341,6 +4376,7 @@ useEffect(() => {
       });
 
       setSelection({ kind: "subtask", projectId: p2Id, experimentId: expId, subTaskId: createdSubId });
+      setLinks((prev) => prev.map((l) => (l.from === itemId ? { ...l, from: createdSubId } : l.to === itemId ? { ...l, to: createdSubId } : l)));
       return;
     }
 
@@ -4622,6 +4658,12 @@ useEffect(() => {
       return prev;
     });
     setSelection((s) => (s && s.kind === "subtask" && s.projectId === projectId && s.subTaskId === subTaskId ? null : s));
+    dropLinksOf([subTaskId]);
+  }
+
+  function dropLinksOf(ids: string[]) {
+    const gone = new Set(ids);
+    setLinks((prev) => (prev.some((l) => gone.has(l.from) || gone.has(l.to)) ? prev.filter((l) => !gone.has(l.from) && !gone.has(l.to)) : prev));
   }
 
   function moveProject(projectId: string, direction: "up" | "down") {
@@ -4947,7 +4989,9 @@ useEffect(() => {
       return n;
     });
     setSelection((s) => (s && s.kind === "item" && s.projectId === projectId && s.itemId === itemId ? null : s));
-    setLinks((prev) => (prev.some((l) => l.from === itemId || l.to === itemId) ? prev.filter((l) => l.from !== itemId && l.to !== itemId) : prev));
+    const exp = projects.find((p) => p.id === projectId)?.lanes.flatMap((l) => l.items).find((it) => it.id === itemId);
+    const subIds = exp?.type === "experiment" ? Object.values(exp.subTasks).flat().map((st) => st.id) : [];
+    dropLinksOf([itemId, ...subIds]);
   }
 
   function updateExperimentRange(projectId: string, laneId: string, expId: string, patch: { start?: DayKey; end?: DayKey }) {
@@ -5798,7 +5842,7 @@ useEffect(() => {
                           onClearSelection={() => setSelection(null)}
                           onAddSubTask={(expId, day) => addExperimentSubTask(project.id, lane.id, expId, day)}
                           onSelectSubTask={(expId, stId) => {
-                            if (linkFrom) { finishLink(expId); return; } // a sub-task links its experiment
+                            if (linkFrom) { finishLink(stId); return; }
                             setSelection({ kind: "subtask", projectId: project.id, experimentId: expId, subTaskId: stId });
                           }}
                           onUpdateSubTaskTitle={(expId, stId, title) => updateExperimentSubTaskTitle(project.id, expId, stId, title)}
