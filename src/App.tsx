@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   DndContext,
-  PointerSensor,
+  MouseSensor,
   TouchSensor,
   closestCenter,
   pointerWithin,
@@ -12,6 +12,8 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { supabase } from "./supabaseClient";
+import { addDays, buildDailyAgenda, diffDays, formatDay, parseDay, parseTimeRange, planRecurringMatches, renderAgendaEmail } from "../supabase/functions/_shared/dailyAgenda.ts";
+import type { DayKey, PlanRecurring } from "../supabase/functions/_shared/dailyAgenda.ts";
 import type { DragEndEvent } from "@dnd-kit/core";
 
 // =====================================================
@@ -22,7 +24,6 @@ import type { DragEndEvent } from "@dnd-kit/core";
 // Types
 // ---------------------------------------------
 
-type DayKey = string; // YYYY-MM-DD
 type ItemType = "task" | "experiment";
 type ViewMode = "plan" | "calendar" | "agenda";
 
@@ -51,18 +52,6 @@ type RecurringEvent = {
   endMin: number;
 };
 
-type PlanRecurring = {
-  id: string;
-  projectId: string;
-  title: string;
-  recurrenceType: "weekly" | "everyN" | "biweekly" | "monthlyDate" | "monthlyLast";
-  weekday: number; // 0=Sun .. 6=Sat (used by weekly, biweekly, monthlyLast)
-  everyNDays?: number; // used by everyN
-  startDate?: DayKey; // anchor date for everyN and biweekly
-  monthDay?: number; // 1-31 for monthlyDate
-  skippedDates?: DayKey[]; // specific dates where this recurring task is skipped
-};
-
 type PersistedStateV1 = {
   version: 1;
   windowStart: DayKey;
@@ -80,6 +69,18 @@ type PersistedStateV1 = {
 };
 
 const STORAGE_KEY = "pmorph_planner_v1";
+
+// Cloud sync: every write is conditional on the updated_at we last saw,
+// so a stale tab/device cannot silently overwrite newer data from elsewhere.
+type CloudRow = { exists: boolean; updatedAt: string | null };
+type CloudLoadResult = ({ ok: true; state: PersistedStateV1 | null } & CloudRow) | { ok: false };
+type CloudSaveResult = { ok: true; updatedAt: string } | { ok: false; conflict: boolean };
+type CloudStatus = "idle" | "saving" | "saved" | "error" | "conflict";
+
+// Only data matters for sync – view/navigation fields are ignored
+function cloudDataKey(s: PersistedStateV1): string {
+  return JSON.stringify({ ...s, windowStart: null, windowLen: null, viewMode: null, calendarDaysLen: null });
+}
 
 type InboxTask = {
   id: string;
@@ -169,38 +170,14 @@ type ResizeExp = {
 // Date utils (UTC-safe)
 // ---------------------------------------------
 
-function parseDay(day: DayKey): Date {
-  const [y, m, d] = day.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d));
-}
-
-function formatDay(date: Date): DayKey {
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
-function addDays(day: DayKey, delta: number): DayKey {
-  const dt = parseDay(day);
-  dt.setUTCDate(dt.getUTCDate() + delta);
-  return formatDay(dt);
-}
-
-function diffDays(from: DayKey, to: DayKey): number {
-  const a = parseDay(from).getTime();
-  const b = parseDay(to).getTime();
-  const MS_PER_DAY = 24 * 60 * 60 * 1000;
-  return Math.round((b - a) / MS_PER_DAY);
-}
-
 function compareDay(a: DayKey, b: DayKey): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+// Today's date in the user's local time zone, as a UTC-based DayKey
 function todayUTC(): DayKey {
   const now = new Date();
-  const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const dt = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
   return formatDay(dt);
 }
 
@@ -209,22 +186,6 @@ function dayLabel(day: DayKey) {
   const weekday = dt.toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" });
   const md = dt.toLocaleDateString(undefined, { month: "numeric", day: "2-digit", timeZone: "UTC" });
   return { weekday, md };
-}
-
-// ---------------------------------------------
-// Time-range parser — extracts HH:MM-HH:MM from task title
-// Returns null if no valid time range found
-// ---------------------------------------------
-
-function parseTimeRange(title: string): { startMin: number; endMin: number } | null {
-  // Match patterns like 10:00-12:00, 10:00–12:30, 10.00-12.00
-  const m = title.match(/\b(\d{1,2})[:\.·](\d{2})\s*[-–—]\s*(\d{1,2})[:\.·](\d{2})\b/);
-  if (!m) return null;
-  const startMin = parseInt(m[1]) * 60 + parseInt(m[2]);
-  const endMin   = parseInt(m[3]) * 60 + parseInt(m[4]);
-  if (startMin >= endMin) return null;
-  if (startMin < 0 || endMin > 24 * 60) return null;
-  return { startMin, endMin };
 }
 
 // ---------------------------------------------
@@ -261,6 +222,25 @@ function removeFromLanes(lanes: Lane[], itemId: string): Lane[] {
   return lanes
     .map((l) => ({ ...l, items: l.items.filter((i) => i.id !== itemId) }))
     .filter((l) => l.items.length > 0);
+}
+
+// Older data can contain overlapping items in one lane (e.g. a task inside an experiment frame).
+// Keep experiments in place and move each conflicting item to the first lane where it fits.
+function resolveLaneOverlaps(lanes: Lane[]): Lane[] {
+  const hasOverlap = lanes.some((l) => l.items.some((a, i) => l.items.some((b, j) => j > i && overlaps(a, b))));
+  if (!hasOverlap) return lanes;
+
+  const out: Lane[] = lanes.map((l) => ({ ...l, items: [] as LaneItem[] }));
+  const place = (item: LaneItem, preferred: number) => {
+    const order = [preferred, ...out.map((_, i) => i).filter((i) => i !== preferred)];
+    const idx = order.find((i) => canPlaceInLane(out[i], item));
+    if (idx !== undefined) out[idx] = upsertIntoLane(out[idx], item);
+    else out.push({ id: `lane_${crypto.randomUUID()}`, items: [item] });
+  };
+  // Experiments first, so tasks are the ones that move out of the frame
+  lanes.forEach((l, i) => l.items.filter((it) => it.type === "experiment").forEach((it) => place(it, i)));
+  lanes.forEach((l, i) => l.items.filter((it) => it.type !== "experiment").forEach((it) => place(it, i)));
+  return out;
 }
 
 function ensureAtLeastOneLane(lanes: Lane[]): Lane[] {
@@ -336,6 +316,87 @@ function isPrefix(id: string, prefix: string) {
 }
 
 // ---------------------------------------------
+// Icons (monochrome, follow currentColor)
+// ---------------------------------------------
+
+type IconName = "chevron-up" | "chevron-down" | "cascade" | "note";
+
+const ICON_PATHS: Record<IconName, string> = {
+  "chevron-up": "M4 10l4-4 4 4",
+  "chevron-down": "M4 6l4 4 4-4",
+  // staggered bars = Gantt cascade
+  cascade: "M2 4h6M5 8h7M8 12h6",
+  // sheet with lines = notes / detail
+  note: "M4 2.5h6l2.5 2.5v8.5h-8.5zM6 7h4.5M6 9.5h4.5M6 12h2.5",
+};
+
+// ---------------------------------------------
+// Touch: scrolling vs. editing
+// A finger that moves right away is scrolling. Creating, moving or resizing
+// starts only after the finger rests for a moment (long-press), and from then
+// on the page must not scroll under the finger.
+// ---------------------------------------------
+
+const TOUCH_HOLD_MS = 400;
+let touchEditActive = false;
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", (e) => { if (touchEditActive && e.cancelable) e.preventDefault(); }, { passive: false });
+}
+
+// Run `start` after a long-press; returns false for mouse/pen (caller acts at once)
+function startAfterTouchHold(e: React.PointerEvent, start: () => void): boolean {
+  if (e.pointerType !== "touch") return false;
+  const { pointerId, clientX, clientY } = e;
+  const cancel = () => {
+    window.clearTimeout(timer);
+    window.removeEventListener("pointermove", move, true);
+    window.removeEventListener("pointerup", cancel, true);
+    window.removeEventListener("pointercancel", cancel, true);
+  };
+  const move = (ev: PointerEvent) => {
+    if (ev.pointerId === pointerId && Math.hypot(ev.clientX - clientX, ev.clientY - clientY) > 8) cancel();
+  };
+  const timer = window.setTimeout(() => {
+    cancel();
+    touchEditActive = true;
+    const end = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      touchEditActive = false;
+      window.removeEventListener("pointerup", end, true);
+      window.removeEventListener("pointercancel", end, true);
+    };
+    window.addEventListener("pointerup", end, true);
+    window.addEventListener("pointercancel", end, true);
+    navigator.vibrate?.(10);
+    start();
+  }, TOUCH_HOLD_MS);
+  window.addEventListener("pointermove", move, true);
+  window.addEventListener("pointerup", cancel, true);
+  window.addEventListener("pointercancel", cancel, true);
+  return true;
+}
+
+// Ref callback for popovers anchored at an item's left edge: shifts the popover
+// left when it would stick out past the scroll area (items near the right edge on phones)
+function keepPopoverInView(el: HTMLElement | null) {
+  if (!el) return;
+  const box = el.closest(".overflow-auto")?.getBoundingClientRect();
+  const minLeft = (box?.left ?? 0) + 8;
+  const maxRight = Math.min(window.innerWidth, box?.right ?? Infinity) - 8;
+  const r = el.getBoundingClientRect();
+  const shift = Math.min(r.right - maxRight, r.left - minLeft);
+  if (shift > 0) el.style.transform = `translateX(-${shift}px)`;
+}
+
+function Icon({ name, size = 14 }: { name: IconName; size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ display: "inline-block", verticalAlign: "-2px" }}>
+      <path d={ICON_PATHS[name]} />
+    </svg>
+  );
+}
+
+// ---------------------------------------------
 // UI blocks
 // ---------------------------------------------
 
@@ -382,7 +443,7 @@ function Draggable({
   return (
     <div
       ref={setNodeRef}
-      style={{ ...style, touchAction: "none" }}
+      style={{ ...style, touchAction: "manipulation" }}
       className={(className ? className + " " : "") + (isDragging ? "opacity-60" : "")}
       {...attributes}
       {...listeners}
@@ -425,13 +486,14 @@ function DroppableCell({
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onContextMenu={(e) => e.preventDefault()} // long-press on a phone creates a task, not a menu
       style={{ 
         width,
         background: isToday ? 'var(--today-bg)' : isWeekend ? 'var(--weekend-bg)' : 'var(--cell-bg)',
         borderColor: 'var(--cell-border)',
       }}
       className={
-        "relative h-20 border-b border-r " +
+        "relative h-full border-b border-r " + // fills the lane row (its height follows content)
         (isOver ? "ring-2 ring-zinc-400 " : "") +
         "cursor-pointer " +
         className
@@ -511,6 +573,7 @@ function Segment({
         onSelect?.();
       }}
       onDoubleClick={(e) => {
+        if (item.type === "experiment") return; // handled by LaneRow: adds a sub-task on that day
         e.stopPropagation();
         const el = (e.currentTarget as HTMLDivElement).querySelector(
           "input[data-title-editor='1']"
@@ -530,8 +593,9 @@ function Segment({
         style={{ background: bg, borderColor: border }}
       >
         {item.type === "task" && (
-          <div className="flex items-center gap-1 truncate text-xs font-semibold text-white">
-            <span className="truncate">{item.title}</span>
+          // Up to two lines fit into the 40px task block; full title on hover
+          <div className="line-clamp-2 break-words text-xs font-semibold leading-4 text-white [hyphens:auto]" title={item.title}>
+            {item.title}
           </div>
         )}
         {item.type === "experiment" && (
@@ -546,7 +610,8 @@ function Segment({
 
       {selected && item.type === "task" && (
         <div
-          className="absolute left-0 top-full z-20 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg"
+          ref={keepPopoverInView}
+          className="absolute left-0 top-full z-20 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
         >
@@ -577,7 +642,7 @@ function Segment({
           </div>
           <div className="mt-2 flex items-center justify-between gap-2">
             <button
-              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
+              className="inline-flex h-8 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
               onClick={(e) => { 
                 e.stopPropagation();
                 commitTitle(); 
@@ -588,7 +653,7 @@ function Segment({
               }}
               title="Open detail with notes"
             >
-              📝 Detail
+              <Icon name="note" size={12} /> Detail
             </button>
             {onMakeRecurring && (
               <button
@@ -687,7 +752,8 @@ function SubTaskPill({
 
       {selected && (
         <div
-          className="absolute left-0 top-full z-30 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg"
+          ref={keepPopoverInView}
+          className="absolute left-0 top-full z-30 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
         >
@@ -718,11 +784,11 @@ function SubTaskPill({
           </div>
           <div className="mt-2 flex items-center justify-between gap-2">
             <button
-              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
+              className="inline-flex h-8 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
               onClick={() => { commit(); onOpenDetail?.(); onClose?.(); }}
               title="Open detail with notes"
             >
-              📝 Detail
+              <Icon name="note" size={12} /> Detail
             </button>
             <div className="flex gap-2">
             <button
@@ -815,6 +881,7 @@ function seed(base: DayKey): Project[] {
 function ExperimentPopover({
   item,
   left,
+  top,
   projectId,
   laneId,
   onUpdateDesc,
@@ -823,6 +890,7 @@ function ExperimentPopover({
 }: {
   item: LaneItem;
   left: number;
+  top: number;
   projectId: string;
   laneId: string;
   onUpdateDesc: (desc: string) => void;
@@ -833,8 +901,9 @@ function ExperimentPopover({
   useEffect(() => { setDraftDesc(item.type === "experiment" ? (item.desc ?? "") : ""); }, [item]);
   return (
     <div
-      className="pointer-events-auto absolute z-[300] w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg"
-      style={{ left, top: -4 }}
+      ref={keepPopoverInView}
+      className="pointer-events-auto absolute z-[300] w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
+      style={{ left, top }}
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
     >
@@ -842,15 +911,18 @@ function ExperimentPopover({
       <textarea
         className="h-20 w-full resize-none rounded-lg border border-zinc-200 p-2 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
         value={draftDesc}
+        autoFocus={!draftDesc} // a fresh experiment: type its name right away
         onChange={(e) => setDraftDesc(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Escape") { e.preventDefault(); setDraftDesc(item.desc ?? ""); onClose(); }
+          // Enter saves like in the task popover; Shift+Enter adds a line
+          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onUpdateDesc(draftDesc); onClose(); }
         }}
         onBlur={() => onUpdateDesc(draftDesc)}
       />
       <div className="mt-2 flex items-center justify-between gap-2">
         <button
-          className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
+          className="inline-flex h-8 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
           onClick={() => { 
             onUpdateDesc(draftDesc); 
             if (typeof (window as any).__openDetail === "function") {
@@ -859,7 +931,7 @@ function ExperimentPopover({
             onClose(); 
           }}
           title="Open detail with notes"
-        >📝 Detail</button>
+        ><Icon name="note" size={12} /> Detail</button>
         <div className="flex gap-2">
           <button className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50" onClick={onDelete}>Delete</button>
           <button className="h-8 rounded-lg bg-zinc-900 px-3 text-sm font-semibold text-white hover:bg-zinc-800" onClick={() => { onUpdateDesc(draftDesc); onClose(); }}>Save</button>
@@ -933,6 +1005,27 @@ function LaneRow({
     (it) => !(compareDay(it.end, days[0]) < 0 || compareDay(days[days.length - 1], it.start) < 0)
   );
 
+  // Row height follows content: room for 2 sub-task pills (or a 40px task),
+  // plus a line for "+N…" and for the experiment description only when needed
+  const experimentsInWindow = itemsInWindow.filter(
+    (it): it is Extract<LaneItem, { type: "experiment" }> => it.type === "experiment"
+  );
+  const hasSubTaskOverflow = experimentsInWindow.some((exp) =>
+    Object.entries(exp.subTasks).some(([day, arr]) => arr.length > 2 && days.includes(day))
+  );
+  const hasExpDesc = experimentsInWindow.some((exp) => !!exp.desc?.trim());
+  const frameH = 48 + (hasSubTaskOverflow ? 16 : 0) + (hasExpDesc ? 12 : 0);
+  const rowH = frameH + 8;
+
+  // Day under the pointer – shows the "+" (add sub-task) button of that day
+  const [hoverDay, setHoverDay] = useState<DayKey | null>(null);
+  const dayAtClientX = (clientX: number): DayKey | null => {
+    const rect = gridRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const idx = Math.floor((clientX - rect.left) / cellW);
+    return idx >= 0 && idx < days.length ? days[idx] : null;
+  };
+
   useEffect(() => {
     if (!resizeExp) return;
     if (resizeExp.projectId !== project.id || resizeExp.laneId !== lane.id) return;
@@ -965,7 +1058,16 @@ function LaneRow({
 
   return (
     <div className="flex">
-      <div ref={gridRef} className="relative flex" style={{ width: days.length * cellW, height: 80 }}>
+      <div
+        ref={gridRef}
+        className="relative flex"
+        style={{ width: days.length * cellW, height: rowH }}
+        onPointerMove={(e) => {
+          const d = dayAtClientX(e.clientX);
+          if (d !== hoverDay) setHoverDay(d);
+        }}
+        onPointerLeave={() => setHoverDay(null)}
+      >
         {/* Cells */}
         <div className="absolute inset-0 flex">
           {days.map((d) => (
@@ -980,21 +1082,20 @@ function LaneRow({
                 if (e.target !== e.currentTarget) return;
                 if (e.button !== 0) return;
                 if (resizeExp) return;
-                // Don't capture pointer immediately on touch — let scroll happen
-                // Capture will happen on first horizontal move in onPointerMove
-                if (e.pointerType !== 'touch') {
-                  (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-                }
-                onStartRange(d, e.pointerId);
+                // Touch: a quick tap or swipe is scrolling – create only after a hold
+                const cell = e.currentTarget as HTMLDivElement;
+                const pid = e.pointerId;
+                if (startAfterTouchHold(e, () => {
+                  try { cell.setPointerCapture(pid); } catch {}
+                  onStartRange(d, pid);
+                })) return;
+                cell.setPointerCapture(pid);
+                onStartRange(d, pid);
               }}
               onPointerMove={(e) => {
                 if (!dragCreate) return;
                 if (dragCreate.projectId !== project.id || dragCreate.laneId !== lane.id) return;
                 if (dragCreate.pointerId !== e.pointerId) return;
-                // On touch: capture pointer on first horizontal move (user is dragging to create, not scrolling)
-                if (e.pointerType === 'touch' && !dragCreate.moved) {
-                  try { (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId); } catch {}
-                }
                 const rect = gridRef.current?.getBoundingClientRect();
                 if (!rect) return;
                 const x = e.clientX - rect.left;
@@ -1044,7 +1145,7 @@ function LaneRow({
             const span = diffDays(visStart, visEnd) + 1;
             const width = span * cellW - 8;
             return (
-              <div className="pointer-events-none absolute" style={{ left, width, top: 4, height: 72 }}>
+              <div className="pointer-events-none absolute" style={{ left, width, top: 4, height: frameH }}>
                 <div className="h-full rounded-md border-2 border-zinc-400 bg-transparent" />
               </div>
             );
@@ -1061,11 +1162,17 @@ function LaneRow({
             const width = span * cellW - 8;
 
             return (
-              <div key={it.id} className="absolute" style={{ left, width, top: 4, height: 72 }}>
+              <div key={it.id} className="absolute" style={{ left, width, top: 4, height: frameH }}>
                 <div className="pointer-events-auto h-full">
                   <Draggable id={`item:${project.id}:${lane.id}:${it.id}`} className={it.type === "experiment" ? "h-full" : ""}>
                     <div
                       className="cursor-grab active:cursor-grabbing h-full"
+                      onDoubleClick={it.type === "experiment" ? (e) => {
+                        // Double-click on an experiment day = add a sub-task there
+                        e.stopPropagation();
+                        const d = dayAtClientX(e.clientX);
+                        if (d && compareDay(d, it.start) >= 0 && compareDay(d, it.end) <= 0) onAddSubTask(it.id, d);
+                      } : undefined}
                       onPointerDown={(e) => {
                         // Ctrl/Cmd + click on experiment = copy to new lane
                         if (it.type === "experiment" && (e.ctrlKey || e.metaKey)) {
@@ -1116,10 +1223,13 @@ function LaneRow({
                           <div
                             className="absolute left-0 top-0 z-20 h-full w-3 cursor-ew-resize"
                             title="Change experiment start"
+                            onTouchStart={(e) => e.stopPropagation()}
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               if (e.button !== 0) return;
-                              onStartResize(it.id, "start", e.pointerId);
+                              const pid = e.pointerId;
+                              if (startAfterTouchHold(e, () => onStartResize(it.id, "start", pid))) return;
+                              onStartResize(it.id, "start", pid);
                             }}
                             onPointerUp={(e) => { e.stopPropagation(); onFinishResize(e.pointerId); }}
                             onPointerCancel={(e) => { e.stopPropagation(); onFinishResize(e.pointerId); }}
@@ -1127,11 +1237,18 @@ function LaneRow({
                           <div
                             className="absolute right-0 top-0 z-20 h-full w-3 cursor-ew-resize"
                             title="Change experiment end"
+                            onTouchStart={(e) => e.stopPropagation()}
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               if (e.button !== 0) return;
-                              (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-                              onStartResize(it.id, "end", e.pointerId);
+                              const handle = e.currentTarget as HTMLDivElement;
+                              const pid = e.pointerId;
+                              const begin = () => {
+                                try { handle.setPointerCapture(pid); } catch {}
+                                onStartResize(it.id, "end", pid);
+                              };
+                              if (startAfterTouchHold(e, begin)) return;
+                              begin();
                             }}
                             onPointerUp={(e) => {
                               e.stopPropagation();
@@ -1167,6 +1284,7 @@ function LaneRow({
                   key={`exp-popover:${it.id}`}
                   item={it}
                   left={left}
+                  top={4 + frameH + 6} // below the frame, so its days and "+" stay clickable
                   projectId={project.id}
                   laneId={lane.id}
                   onUpdateDesc={(desc) => onUpdateDesc(project.id, it.id, desc)}
@@ -1176,28 +1294,22 @@ function LaneRow({
               );
             })}
 
-          {/* ExpDay click zones */}
-          {itemsInWindow
-            .filter((it) => it.type === "experiment")
-            .flatMap((it) => {
-              const exp = it as Extract<LaneItem, { type: "experiment" }>;
-              const nodes: React.ReactNode[] = [];
-              for (const day of days) {
-                if (compareDay(day, exp.start) < 0 || compareDay(day, exp.end) > 0) continue;
-                const x = diffDays(days[0], day) * cellW + 8;
-                nodes.push(
-                  <ExpDayDroppable
-                    key={`expday:${exp.id}:${day}`}
-                    id={`expday:${project.id}:${lane.id}:${exp.id}:${day}`}
-                    title="Click: add task to experiment"
-                    style={{ left: x, top: 52, width: cellW - 16, height: 20 }}
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onClick={(e) => { e.stopPropagation(); onAddSubTask(exp.id, day); }}
-                  />
-                );
-              }
-              return nodes;
-            })}
+          {/* ExpDay drop zones (drag a task/sub-task into the experiment) – not clickable */}
+          {experimentsInWindow.flatMap((exp) => {
+            const nodes: React.ReactNode[] = [];
+            for (const day of days) {
+              if (compareDay(day, exp.start) < 0 || compareDay(day, exp.end) > 0) continue;
+              const x = diffDays(days[0], day) * cellW + 8;
+              nodes.push(
+                <ExpDayDroppable
+                  key={`expday:${exp.id}:${day}`}
+                  id={`expday:${project.id}:${lane.id}:${exp.id}:${day}`}
+                  style={{ left: x, top: 4 + frameH - 20, width: cellW - 16, height: 20, pointerEvents: "none" }}
+                />
+              );
+            }
+            return nodes;
+          })}
 
           {/* Experiment subtask pills */}
           {itemsInWindow
@@ -1253,7 +1365,8 @@ function LaneRow({
 
                     {expandedDay && expandedDay.expId === exp.id && expandedDay.day === day && (
                       <div
-                        className="absolute left-0 top-full z-40 mt-2 w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg"
+                        ref={keepPopoverInView}
+                        className="absolute left-0 top-full z-40 mt-2 w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
                         onClick={(e) => e.stopPropagation()}
                         onPointerDown={(e) => e.stopPropagation()}
                       >
@@ -1301,6 +1414,35 @@ function LaneRow({
               }
               return out;
             })}
+
+          {/* "+" add sub-task: on the hovered day, or on every day of a selected experiment (touch) */}
+          {experimentsInWindow.flatMap((exp) => {
+            const expSelected = !!selection && selection.kind === "item" && selection.projectId === project.id && selection.itemId === exp.id;
+            return days
+              .filter((day) => compareDay(day, exp.start) >= 0 && compareDay(day, exp.end) <= 0)
+              .filter((day) => expSelected || day === hoverDay)
+              .map((day) => (
+                <button
+                  key={`add:${exp.id}:${day}`}
+                  className="pointer-events-auto absolute z-30 flex items-center justify-center rounded-full border text-sm font-semibold leading-none shadow-sm hover:scale-110"
+                  style={{
+                    left: diffDays(days[0], day) * cellW + cellW - 8 - 18,
+                    top: 4 + frameH - 4 - 18,
+                    width: 18,
+                    height: 18,
+                    background: "var(--pp-surface)",
+                    borderColor: project.color,
+                    color: project.color,
+                  }}
+                  title="Add task to experiment (or double-click the day)"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); onAddSubTask(exp.id, day); }}
+                >
+                  +
+                </button>
+              ));
+          })}
         </div>
       </div>
     </div>
@@ -1312,10 +1454,10 @@ function LaneRow({
 // AgendaView component
 // ---------------------------------------------
 
-function AgendaDayDrop({ day, children, darkMode }: { day: DayKey; children: React.ReactNode; darkMode?: boolean }) {
+function AgendaDayDrop({ day, children }: { day: DayKey; children: React.ReactNode; darkMode?: boolean }) {
   const { setNodeRef, isOver } = useDroppable({ id: `agenda-day:${day}` });
   return (
-    <div ref={setNodeRef} className="flex-1 px-4 py-3" style={{ background: isOver ? (darkMode ? 'rgba(56,100,180,0.15)' : 'rgba(219,234,254,0.5)') : undefined, minHeight: 40, borderRadius: isOver ? 8 : 0, transition: 'background 0.15s' }}>
+    <div ref={setNodeRef} className="flex-1 px-4 py-3" style={{ background: isOver ? ('var(--pp-today-tint)') : undefined, minHeight: 40, borderRadius: isOver ? 8 : 0, transition: 'background 0.15s' }}>
       {children}
     </div>
   );
@@ -1325,7 +1467,7 @@ function AgendaDraggable({ id, children }: { id: string; children: React.ReactNo
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: `agenda-item:${id}` });
   const style: React.CSSProperties = transform ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`, opacity: isDragging ? 0.5 : 1, zIndex: isDragging ? 50 : undefined } : {};
   return (
-    <div ref={setNodeRef} {...attributes} {...listeners} style={{ ...style, touchAction: 'none' }}>
+    <div ref={setNodeRef} {...attributes} {...listeners} style={{ ...style, touchAction: 'manipulation' }}>
       {children}
     </div>
   );
@@ -1358,8 +1500,8 @@ function AgendaView({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 6 } })
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 8 } })
   );
 
   // Build per-day item list from all projects
@@ -1459,20 +1601,20 @@ function AgendaView({
   }
 
   return (
-    <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-2xl border shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+    <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-2xl border shadow-sm" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
       {!hasAnyItem ? (
-        <div className="flex h-40 items-center justify-center text-sm" style={{ color: darkMode ? '#8e8e93' : '#a1a1aa' }}>
+        <div className="flex h-40 items-center justify-center text-sm" style={{ color: 'var(--pp-icon-faint)' }}>
           No tasks planned in this period.
         </div>
       ) : (
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onAgendaDragEnd}>
-        <div style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+        <div style={{ borderColor: 'var(--pp-hover)' }}>
           {/* Project color legend */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b px-5 py-2.5" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b px-5 py-2.5" style={{ borderColor: 'var(--pp-hover)' }}>
             {projects.map((p) => (
               <div key={p.id} className="flex items-center gap-1.5">
                 <span style={{ width: 9, height: 9, borderRadius: '50%', background: p.color, flexShrink: 0, display: 'inline-block' }} />
-                <span className="text-xs font-medium" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>{p.name}</span>
+                <span className="text-xs font-medium" style={{ color: 'var(--pp-text-muted)' }}>{p.name}</span>
               </div>
             ))}
           </div>
@@ -1485,30 +1627,30 @@ function AgendaView({
 
             return (
               <div key={day} className="flex gap-0" style={{ 
-                background: isToday ? (darkMode ? 'rgba(56, 100, 180, 0.12)' : 'rgba(219, 234, 254, 0.4)') : 'transparent',
-                borderBottom: `1px solid ${darkMode ? '#3a3a3c' : '#f4f4f5'}`,
+                background: isToday ? ('var(--pp-today-col)') : 'transparent',
+                borderBottom: `1px solid ${'var(--pp-hover)'}`,
               }}>
                 {/* Date column */}
                 {(() => {
                   const dt = parseDay(day);
                   const dayNum = dt.getUTCDate();
-                  const monthNum = dt.getUTCMonth() + 1;
+                  const monthName = dt.toLocaleDateString(undefined, { month: "short", timeZone: "UTC" });
                   return (
                     <div className="w-20 flex-shrink-0 px-3 py-3 text-right" style={{ 
-                      background: isToday ? (darkMode ? 'rgba(56, 100, 180, 0.2)' : '#eff6ff') : (darkMode ? 'rgba(255,255,255,0.03)' : 'rgba(250,250,250,0.6)'),
+                      background: isToday ? ('var(--pp-today-bg)') : ('var(--pp-row-alt)'),
                     }}>
-                      <div className="text-[11px] font-semibold" style={{ color: isToday ? (darkMode ? '#93bbfd' : '#3b82f6') : isWeekend ? (darkMode ? '#f87171' : '#f87171') : (darkMode ? '#8e8e93' : '#a1a1aa') }}>
+                      <div className="text-[11px] font-semibold" style={{ color: isToday ? ('var(--pp-accent-2)') : isWeekend ? ('#f87171') : ('var(--pp-icon-faint)') }}>
                         {weekday}
                       </div>
-                      <div className="text-2xl font-bold leading-tight" style={{ color: isToday ? (darkMode ? '#93bbfd' : '#2563eb') : isWeekend ? (darkMode ? '#f87171' : '#ef4444') : (darkMode ? '#e5e5e7' : '#18181b') }}>
+                      <div className="text-2xl font-bold leading-tight" style={{ color: isToday ? ('var(--pp-accent)') : isWeekend ? ('var(--pp-danger)') : ('var(--pp-text)') }}>
                         {isToday ? (
                           <span className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-blue-500 text-white text-xl">
                             {dayNum}
                           </span>
                         ) : dayNum}
                       </div>
-                      <div className="text-[10px]" style={{ color: isToday ? (darkMode ? '#60a5fa' : '#60a5fa') : (darkMode ? '#636366' : '#a1a1aa') }}>
-                        {monthNum}/
+                      <div className="text-[10px]" style={{ color: isToday ? ('#60a5fa') : ('var(--pp-text-faint)') }}>
+                        {monthName}
                       </div>
                     </div>
                   );
@@ -1517,7 +1659,7 @@ function AgendaView({
                 {/* Items column — droppable */}
                 <AgendaDayDrop day={day} darkMode={darkMode}>
                   {entries.length === 0 ? (
-                    <div className="flex h-full min-h-[36px] items-center text-xs" style={{ color: darkMode ? '#48484a' : '#d4d4d8' }}>—</div>
+                    <div className="flex h-full min-h-[36px] items-center text-xs" style={{ color: 'var(--pp-border-input)' }}>—</div>
                   ) : (
                     <div className="space-y-1">
                       {entries.map((entry) => (
@@ -1543,7 +1685,7 @@ function AgendaView({
                               <input
                                 autoFocus
                                 className="w-full rounded border px-1 py-0.5 text-sm font-medium outline-none"
-                                style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                                style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                                 value={editingTitle}
                                 onChange={(e) => setEditingTitle(e.target.value)}
                                 onKeyDown={(e) => {
@@ -1564,14 +1706,14 @@ function AgendaView({
                                 <span
                                   className="font-medium cursor-text"
                                   style={{
-                                    color: darkMode ? '#e5e5e7' : '#18181b',
+                                    color: 'var(--pp-text)',
                                     textDecoration: completedTasks[entry.id] ? 'line-through' : 'none',
                                   }}
                                 >
                                   {entry.title}
                                 </span>
                                 {entry.expTitle && (
-                                  <span className="ml-1.5 text-[10px]" style={{ color: darkMode ? '#8e8e93' : '#a1a1aa' }}>({entry.expTitle})</span>
+                                  <span className="ml-1.5 text-[10px]" style={{ color: 'var(--pp-icon-faint)' }}>({entry.expTitle})</span>
                                 )}
                               </>
                             )}
@@ -1585,9 +1727,9 @@ function AgendaView({
                                 width: 24,
                                 height: 24,
                                 borderRadius: 6,
-                                border: `1px solid ${darkMode ? '#48484a' : '#e4e4e7'}`,
-                                background: darkMode ? '#3a3a3c' : 'white',
-                                color: darkMode ? '#a1a1a6' : '#71717a',
+                                border: `1px solid ${'var(--pp-border-strong)'}`,
+                                background: 'var(--pp-surface-raised)',
+                                color: 'var(--pp-text-muted)',
                                 fontSize: 12,
                                 cursor: "pointer",
                                 display: "flex",
@@ -1606,9 +1748,9 @@ function AgendaView({
                                 width: 24,
                                 height: 24,
                                 borderRadius: 6,
-                                border: `1px solid ${darkMode ? '#48484a' : '#e4e4e7'}`,
-                                background: darkMode ? '#3a3a3c' : 'white',
-                                color: darkMode ? '#f87171' : '#ef4444',
+                                border: `1px solid ${'var(--pp-border-strong)'}`,
+                                background: 'var(--pp-surface-raised)',
+                                color: 'var(--pp-danger)',
                                 fontSize: 12,
                                 cursor: "pointer",
                                 display: "flex",
@@ -1654,12 +1796,12 @@ function CalendarView({
   setRecurringModal,
   calendarDaysLen,
   setCalendarDaysLen,
+  maxDays = 7,
   sensors,
   resizeEvt,
   setResizeEvt,
   planRecurring = [],
   projects: calProjects = [],
-  darkMode = false,
   onCreateNewTask,
 }: {
   days: DayKey[];
@@ -1677,6 +1819,7 @@ function CalendarView({
   setRecurringModal: React.Dispatch<React.SetStateAction<boolean>>;
   calendarDaysLen: 1 | 2 | 3 | 5 | 7;
   setCalendarDaysLen: React.Dispatch<React.SetStateAction<1 | 2 | 3 | 5 | 7>>;
+  maxDays?: number; // phone in portrait: more days would not fit
   sensors: any;
   resizeEvt: { id: string; pointerId: number } | null;
   setResizeEvt: React.Dispatch<React.SetStateAction<{ id: string; pointerId: number } | null>>;
@@ -1688,6 +1831,16 @@ function CalendarView({
   const startHour = 6;
   const endHour = 24;
   const hourH = 44;
+
+  // Current local time for the "now" line, refreshed every minute
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(new Date()), 60_000);
+    return () => window.clearInterval(t);
+  }, []);
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowDayIdx = days.indexOf(todayUTC());
+
   // dayW computed from actual container width so columns fill full available space
   const calWrapRef = useRef<HTMLDivElement | null>(null);
   const [calW, setCalW] = useState<number>(0);
@@ -1780,10 +1933,10 @@ function CalendarView({
     return (
       <div
         ref={setNodeRef}
-        className={"absolute inset-y-0 " + (isOver ? (darkMode ? "bg-zinc-700/30" : "bg-zinc-100") : "")}
+        className={"absolute inset-y-0 " + (isOver ? "bg-zinc-100 dark:bg-zinc-700/30" : "")}
         style={{ 
           left: TIME_COL + idx * dayW, width: dayW,
-          background: isOver ? undefined : isTodayCol ? (darkMode ? 'rgba(56,100,180,0.12)' : 'rgba(219,234,254,0.4)') : isWeekendCol ? (darkMode ? 'rgba(160,60,60,0.08)' : 'rgba(254,202,202,0.3)') : 'transparent',
+          background: isOver ? undefined : isTodayCol ? ('var(--pp-today-col)') : isWeekendCol ? ('var(--pp-weekend-col)') : 'transparent',
         }}
       />
     );
@@ -1828,7 +1981,7 @@ function CalendarView({
       <div
         ref={setNodeRef}
         className={"absolute pointer-events-auto " + (isDragging ? "opacity-60" : "")}
-        style={{ left, top: 44 + top, width, height, ...dragStyle, touchAction: "none", zIndex: isSelected ? 30 : 10 }}
+        style={{ left, top, width, height, ...dragStyle, touchAction: "manipulation", zIndex: isSelected ? 30 : 10 }}
       >
         <div
           ref={setActivatorNodeRef}
@@ -1876,11 +2029,18 @@ function CalendarView({
             <div
               className="absolute bottom-0 left-0 right-0 h-3 cursor-ns-resize"
               title="Change end time"
+              onTouchStart={(e) => e.stopPropagation()}
               onPointerDown={(e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (e.button !== 0) return;
-                (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-                setResizeEvt({ id: ev.id, pointerId: e.pointerId });
+                const handle = e.currentTarget as HTMLDivElement;
+                const pid = e.pointerId;
+                const begin = () => {
+                  try { handle.setPointerCapture(pid); } catch {}
+                  setResizeEvt({ id: ev.id, pointerId: pid });
+                };
+                if (startAfterTouchHold(e, begin)) return;
+                begin();
               }}
             />
           )}
@@ -1897,15 +2057,16 @@ function CalendarView({
         {/* Popover with Detail, Save, Delete, Remove */}
         {isSelected && !isRec && task && (
           <div
+            ref={keepPopoverInView}
             className="absolute left-0 top-full z-[300] mt-1 w-[240px] rounded-xl border bg-white p-2 shadow-lg"
-            style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', background: darkMode ? '#2c2c2e' : 'white' }}
+            style={{ borderColor: 'var(--pp-border)', background: 'var(--pp-surface)' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between gap-1">
               <button
-                className="h-7 rounded-lg border px-2 text-xs hover:bg-zinc-50"
-                style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b', background: darkMode ? '#3a3a3c' : 'white' }}
+                className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border px-2 text-xs hover:bg-zinc-50"
+                style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)', background: 'var(--pp-surface-raised)' }}
                 onClick={() => {
                   commitTitle();
                   // Open detail panel via global function
@@ -1923,11 +2084,11 @@ function CalendarView({
                   setSelectedEvtId(null);
                 }}
                 title="Notes & checklist"
-              >📝 Detail</button>
+              ><Icon name="note" size={12} /> Detail</button>
               {task.meta && (
               <button
                 className="h-7 rounded-lg border px-2 text-xs hover:bg-zinc-50"
-                style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b', background: darkMode ? '#3a3a3c' : 'white' }}
+                style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)', background: 'var(--pp-surface-raised)' }}
                 onClick={() => {
                   commitTitle();
                   const m = task.meta as any;
@@ -1944,13 +2105,13 @@ function CalendarView({
               )}
               <button
                 className="h-7 rounded-lg border px-2 text-xs hover:bg-zinc-50"
-                style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b', background: darkMode ? '#3a3a3c' : 'white' }}
+                style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)', background: 'var(--pp-surface-raised)' }}
                 onClick={() => { onDeleteEvent(ev.id); setSelectedEvtId(null); }}
                 title="Remove from calendar only"
               >Unschedule</button>
               <button
                 className="h-7 rounded-lg border px-2 text-xs text-red-500 hover:bg-red-50"
-                style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', background: darkMode ? '#3a3a3c' : 'white' }}
+                style={{ borderColor: 'var(--pp-border-strong)', background: 'var(--pp-surface-raised)' }}
                 onClick={() => {
                   // Delete timed event AND the task from plan
                   onDeleteEvent(ev.id);
@@ -1978,7 +2139,7 @@ function CalendarView({
       if (e.pointerId !== pid) return;
       const rect = gridRef.current?.getBoundingClientRect();
       if (!rect) return;
-      const y = e.clientY - rect.top - 44;
+      const y = e.clientY - rect.top;
       const minutesFromStart = Math.max(0, Math.min((endHour - startHour) * 60, Math.round((y / hourH) * 60 / 15) * 15));
       const ev = events.find((x) => x.id === resizeEvt.id);
       if (!ev) return;
@@ -2016,7 +2177,7 @@ function CalendarView({
       let dropStartMin = 9 * 60; // fallback
       if (rect && ev.activatorEvent) {
         const clientY = (ev.activatorEvent as PointerEvent).clientY + (ev.delta?.y ?? 0);
-        const y = clientY - rect.top - 44;
+        const y = clientY - rect.top;
         const raw = Math.round((y / hourH) * 60 / 15) * 15 + startHour * 60;
         dropStartMin = Math.max(startHour * 60, Math.min(endHour * 60 - 60, raw));
       }
@@ -2089,8 +2250,7 @@ function CalendarView({
       // Strip the time part for display title
       const displayTitle = r.title.replace(/\d{1,2}[:.]\d{2}\s*[-–]\s*\d{1,2}[:.]\d{2}/, "").trim();
       for (const day of days) {
-        const dt = parseDay(day);
-        if (dt.getUTCDay() !== r.weekday) continue;
+        if (!planRecurringMatches(r, day)) continue;
         out.push({
           id: `planrec:${r.id}:${day}`,
           day,
@@ -2149,19 +2309,19 @@ function CalendarView({
   }, [events, recurringInstances, days]);
 
   return (
-    <div className="mt-4 rounded-2xl border shadow-sm flex flex-col min-h-0 flex-1" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+    <div className="mt-4 rounded-2xl border shadow-sm flex flex-col min-h-0 flex-1" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
       <div className="flex items-center justify-between p-4 pb-0 flex-shrink-0">
         <div className="flex items-center gap-2">
-          <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Calendar</div>
+          <div className="text-sm font-semibold" style={{ color: 'var(--pp-text)' }}>Calendar</div>
         </div>
         <div className="flex items-center gap-2">
-          <div className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Days:</div>
-          <div className="flex items-center gap-1 rounded-lg border p-1" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-            {([1, 2, 3, 5, 7] as const).map((n) => (
+          <div className="text-xs" style={{ color: 'var(--pp-text-secondary)' }}>Days:</div>
+          <div className="flex items-center gap-1 rounded-lg border p-1" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
+            {([1, 2, 3, 5, 7] as const).filter((n) => n <= maxDays).map((n) => (
               <button
                 key={n}
                 className="rounded-md px-2 py-1 text-xs hover:opacity-80"
-                style={calendarDaysLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                style={calendarDaysLen === n ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
                 onClick={() => setCalendarDaysLen(n)}
               >
                 {n}
@@ -2174,15 +2334,40 @@ function CalendarView({
       <DndContext sensors={sensors} collisionDetection={collisionDetection} onDragEnd={onCalDragEnd}>
         <div className="mt-4 overflow-auto flex-1 px-4 pb-4">
           <div ref={calWrapRef} style={{ width: "100%", minWidth: 56 + days.length * 80 }}>
-            {/* Per-day inbox row */}
+            {/* Day header + per-day all-day row stay visible while scrolling the hours */}
+            <div className="sticky top-0 z-40" style={{ background: 'var(--pp-surface)' }}>
+            {/* Header */}
+            <div className="flex" style={{ height: 44, width: "100%" }}>
+              <div className="border flex-shrink-0" style={{ width: TIME_COL, borderColor: 'var(--pp-border)', background: 'var(--pp-surface)' }} />
+              {days.map((d) => {
+                const { weekday, md } = dayLabel(d);
+                const wk = weekday.toLowerCase();
+                const isWeekend = wk.startsWith("sat") || wk.startsWith("sun") || wk.startsWith("so") || wk.startsWith("ne");
+                const isToday = d === todayUTC();
+                return (
+                  <div key={d} className="border px-2 py-2 text-center" style={{
+                    width: dayW, flexShrink: 0,
+                    borderColor: 'var(--pp-border)',
+                    background: isToday ? ('var(--pp-today-bg)') : isWeekend ? ('var(--pp-weekend-bg)') : ('var(--pp-surface)'),
+                  }}>
+                    <div className="text-xs font-medium" style={{ color: isToday ? ('var(--pp-accent)') : isWeekend ? ('var(--pp-danger-strong)') : ('var(--pp-text-label)'), fontWeight: isToday ? 700 : 500 }}>{weekday}</div>
+                    <div className="text-xs" style={{ color: isToday ? ('var(--pp-accent-soft)') : isWeekend ? ('var(--pp-danger)') : ('var(--pp-icon)') }}>
+                      {isToday ? <span className="inline-block rounded-full bg-blue-500 text-white px-1.5">{md}</span> : md}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Per-day all-day (unscheduled) tasks row */}
             <div className="flex" style={{ width: "100%" }}>
-              <div className="flex-shrink-0" style={{ width: TIME_COL }} />
+              <div className="flex-shrink-0 border px-1 py-1 text-[10px] leading-tight" style={{ width: TIME_COL, borderColor: 'var(--pp-border)', color: 'var(--pp-text-faint)' }}>all-day</div>
               {days.map((d) => (
-                <div key={d} className="border" style={{ width: dayW, flexShrink: 0, background: darkMode ? '#1c1c1e' : '#fafafa', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+                <div key={d} className="border" style={{ width: dayW, flexShrink: 0, background: 'var(--pp-bg-subtle)', borderColor: 'var(--pp-border)' }}>
                   <div className="px-2 py-1">
                     <div className="flex flex-wrap gap-1">
                       {(inboxByDay[d] ?? []).length === 0 ? (
-                        <span className="text-[11px]" style={{ color: darkMode ? '#636366' : '#71717a' }}>&nbsp;</span>
+                        <span className="text-[11px]" style={{ color: 'var(--pp-text-faint-2)' }}>&nbsp;</span>
                       ) : (
                         (inboxByDay[d] ?? []).map((t) => (
                           <Draggable key={t.id} id={`inbox:${t.id}`}>
@@ -2191,7 +2376,7 @@ function CalendarView({
                               style={{ background: t.color }}
                               title={t.title}
                             >
-                              <div className="truncate max-w-[150px]">{t.title}</div>
+                              <div className="truncate" style={{ maxWidth: Math.min(150, dayW - 32) }}>{t.title}</div>
                             </div>
                           </Draggable>
                         ))
@@ -2201,62 +2386,53 @@ function CalendarView({
                 </div>
               ))}
             </div>
+            </div>
 
             {/* Calendar grid */}
             <div
               ref={gridRef}
               className="relative"
-              style={{ width: "100%", height: 44 + (endHour - startHour) * hourH }}
+              style={{ width: "100%", height: (endHour - startHour) * hourH }}
             >
-              {/* Header */}
-              <div className="absolute left-0 top-0 flex" style={{ height: 44, width: "100%" }}>
-                <div className="border flex-shrink-0" style={{ width: TIME_COL, borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', background: darkMode ? '#2c2c2e' : 'white' }} />
-                {days.map((d) => {
-                  const { weekday, md } = dayLabel(d);
-                  const wk = weekday.toLowerCase();
-                  const isWeekend = wk.startsWith("sat") || wk.startsWith("sun") || wk.startsWith("so") || wk.startsWith("ne");
-                  const isToday = d === todayUTC();
-                  return (
-                    <div key={d} className="border px-2 py-2 text-center" style={{ 
-                      width: dayW, flexShrink: 0, 
-                      borderColor: darkMode ? '#3a3a3c' : '#e4e4e7',
-                      background: isToday ? (darkMode ? 'rgba(56,100,180,0.2)' : '#eff6ff') : isWeekend ? (darkMode ? 'rgba(160,60,60,0.12)' : 'rgba(254,226,226,0.6)') : (darkMode ? '#2c2c2e' : 'white'),
-                    }}>
-                      <div className="text-xs font-medium" style={{ color: isToday ? (darkMode ? '#93bbfd' : '#2563eb') : isWeekend ? (darkMode ? '#f87171' : '#dc2626') : (darkMode ? '#a1a1a6' : '#3f3f46'), fontWeight: isToday ? 700 : 500 }}>{weekday}</div>
-                      <div className="text-xs" style={{ color: isToday ? (darkMode ? '#60a5fa' : '#3b82f6') : isWeekend ? (darkMode ? '#f87171' : '#ef4444') : (darkMode ? '#8e8e93' : '#71717a') }}>
-                        {isToday ? <span className="inline-block rounded-full bg-blue-500 text-white px-1.5">{md}</span> : md}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-
               {days.map((d) => <DayDrop key={d} day={d} />)}
 
               {hours.map((h, idx) => {
                 if (h === endHour) return null;
-                const top = 44 + idx * hourH;
+                const top = idx * hourH;
                 return (
                   <React.Fragment key={h}>
-                    <div className="absolute left-0" style={{ top, width: TIME_COL, height: 0, borderTop: `1px solid ${darkMode ? '#3a3a3c' : '#e4e4e7'}` }} />
-                    <div className="absolute left-0 px-2 text-[11px]" style={{ top: top + 2, width: TIME_COL, color: darkMode ? '#8e8e93' : '#52525b' }}>
+                    <div className="absolute left-0" style={{ top, width: TIME_COL, height: 0, borderTop: `1px solid ${'var(--pp-border)'}` }} />
+                    <div className="absolute left-0 px-2 text-[11px]" style={{ top: top + 2, width: TIME_COL, color: 'var(--pp-icon-strong)' }}>
                       {String(h).padStart(2, "0")}:00
                     </div>
-                    <div className="absolute" style={{ top, left: TIME_COL, right: 0, borderTop: `1px solid ${darkMode ? '#3a3a3c' : '#e4e4e7'}` }} />
+                    <div className="absolute" style={{ top, left: TIME_COL, right: 0, borderTop: `1px solid ${'var(--pp-border)'}` }} />
+                    {/* Faint half-hour line */}
+                    <div className="absolute" style={{ top: top + hourH / 2, left: TIME_COL, right: 0, borderTop: `1px dashed ${'var(--pp-border)'}`, opacity: 0.6 }} />
                   </React.Fragment>
                 );
               })}
 
               {days.map((_, i) => (
-                <div key={i} className="absolute top-[44px] bottom-0" style={{ left: TIME_COL + i * dayW, borderLeft: `1px solid ${darkMode ? '#3a3a3c' : '#e4e4e7'}` }} />
+                <div key={i} className="absolute top-0 bottom-0" style={{ left: TIME_COL + i * dayW, borderLeft: `1px solid ${'var(--pp-border)'}` }} />
               ))}
+
+              {/* "Now" line in today's column */}
+              {nowDayIdx >= 0 && nowMin >= startHour * 60 && nowMin < endHour * 60 && (
+                <div
+                  className="pointer-events-none absolute z-20"
+                  style={{ left: TIME_COL + nowDayIdx * dayW - 4, width: dayW + 4, top: (nowMin / 60 - startHour) * hourH - 4, height: 8 }}
+                >
+                  <div className="absolute rounded-full" style={{ left: 0, top: 0, width: 8, height: 8, background: '#ef4444' }} />
+                  <div className="absolute" style={{ left: 4, right: 0, top: 3, height: 2, background: '#ef4444' }} />
+                </div>
+              )}
 
               {/* Click-to-create overlay: clicking on empty space creates a new task */}
               {days.map((d, i) => (
                 <div
                   key={`click-${d}`}
                   className="absolute cursor-pointer"
-                  style={{ left: TIME_COL + i * dayW, top: 44, width: dayW, height: (endHour - startHour) * hourH }}
+                  style={{ left: TIME_COL + i * dayW, top: 0, width: dayW, height: (endHour - startHour) * hourH }}
                   onClick={(e) => {
                     // Only trigger if clicking directly on this overlay (not on an event)
                     if (e.target !== e.currentTarget) return;
@@ -2286,14 +2462,14 @@ function CalendarView({
         >
           <div
             className="w-full max-w-md rounded-2xl border p-4 shadow-xl"
-            style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+            style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-start justify-between">
               <div className="text-sm font-semibold">{editingRecId ? "Edit recurring" : "New recurring"}</div>
               <button
                 className="h-8 w-8 rounded-full border shadow-sm"
-                style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}
                 onClick={() => setRecurringModal(false)}
                 title="Close"
               >
@@ -2303,10 +2479,10 @@ function CalendarView({
 
             <div className="mt-3 space-y-3">
               <div>
-                <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Name</div>
+                <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-secondary)' }}>Name</div>
                 <input
                   className="h-9 w-full rounded-lg border px-3 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
-                  style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                  style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                   placeholder="e.g. meeting / seminar"
                   value={recForm.title}
                   onChange={(e) => setRecForm((p) => ({ ...p, title: e.target.value }))}
@@ -2315,10 +2491,10 @@ function CalendarView({
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Weekday</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-secondary)' }}>Weekday</div>
                   <select
                     className="h-9 w-full rounded-lg border px-3 text-sm"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     value={recForm.weekday}
                     onChange={(e) => setRecForm((p) => ({ ...p, weekday: Number(e.target.value) }))}
                   >
@@ -2332,11 +2508,11 @@ function CalendarView({
                   </select>
                 </div>
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>Color</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-secondary)' }}>Color</div>
                   <input
                     type="color"
                     className="h-9 w-full rounded-lg border px-2"
-                    style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}
+                    style={{ borderColor: 'var(--pp-border)' }}
                     value={recForm.color}
                     onChange={(e) => setRecForm((p) => ({ ...p, color: e.target.value }))}
                   />
@@ -2345,21 +2521,21 @@ function CalendarView({
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>From</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-secondary)' }}>From</div>
                   <input
                     type="time"
                     className="h-9 w-full rounded-lg border px-3 text-sm"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     value={recForm.from}
                     onChange={(e) => setRecForm((p) => ({ ...p, from: e.target.value }))}
                   />
                 </div>
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#52525b' }}>To</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-secondary)' }}>To</div>
                   <input
                     type="time"
                     className="h-9 w-full rounded-lg border px-3 text-sm"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     value={recForm.to}
                     onChange={(e) => setRecForm((p) => ({ ...p, to: e.target.value }))}
                   />
@@ -2369,7 +2545,7 @@ function CalendarView({
               <div className="flex items-center justify-between gap-2">
                 <button
                   className="h-9 rounded-lg border px-3 text-sm"
-                  style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                  style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}
                   onClick={() => setRecurringModal(false)}
                 >
                   Cancel
@@ -2378,7 +2554,7 @@ function CalendarView({
                   {editingRecId && (
                     <button
                       className="h-9 rounded-lg border px-3 text-sm"
-                      style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}
                       onClick={() => { onDeleteRecurring(editingRecId); setRecurringModal(false); }}
                       title="Delete recurring"
                     >
@@ -2387,7 +2563,7 @@ function CalendarView({
                   )}
                   <button
                     className="h-9 rounded-lg px-3 text-sm font-semibold text-white"
-                    style={{ background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' }}
+                    style={{ background: 'var(--pp-text)', color: 'var(--pp-bg)' }}
                     onClick={() => {
                       const title = recForm.title.trim();
                       if (!title) return;
@@ -2406,7 +2582,7 @@ function CalendarView({
                 </div>
               </div>
 
-              <div className="text-[11px]" style={{ color: darkMode ? '#8e8e93' : '#52525b' }}>
+              <div className="text-[11px]" style={{ color: 'var(--pp-icon-strong)' }}>
                 Recurring events are separate blocks. Click the block or ↻ to edit.
               </div>
             </div>
@@ -2426,19 +2602,19 @@ function CalendarView({
               left: Math.min(quickCreate.x, window.innerWidth - 300),
               top: Math.min(quickCreate.y, window.innerHeight - 200),
               width: 280,
-              background: darkMode ? '#2c2c2e' : 'white',
-              borderColor: darkMode ? '#48484a' : '#e4e4e7',
-              color: darkMode ? '#e5e5e7' : '#18181b',
+              background: 'var(--pp-surface)',
+              borderColor: 'var(--pp-border-strong)',
+              color: 'var(--pp-text)',
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="text-xs font-semibold mb-2" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>
+            <div className="text-xs font-semibold mb-2" style={{ color: 'var(--pp-text-muted)' }}>
               New task — {dayLabel(quickCreate.day).weekday} {dayLabel(quickCreate.day).md} · {String(Math.floor(quickCreate.startMin / 60)).padStart(2, "0")}:{String(quickCreate.startMin % 60).padStart(2, "0")}
             </div>
             <input
               autoFocus
               className="h-9 w-full rounded-lg border px-3 text-sm outline-none focus:ring-2 focus:ring-blue-300"
-              style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+              style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
               placeholder="task name…"
               value={qcTitle}
               onChange={(e) => setQcTitle(e.target.value)}
@@ -2457,7 +2633,7 @@ function CalendarView({
             <div className="mt-2 flex items-center gap-2">
               <select
                 className="h-8 flex-1 rounded-lg border px-2 text-xs"
-                style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                 value={qcProjectId || calProjects[0]?.id}
                 onChange={(e) => setQcProjectId(e.target.value)}
               >
@@ -2496,7 +2672,6 @@ function DetailPanel({
   projects,
   onClose,
   onUpdateProjects,
-  darkMode = false,
   inbox = [],
   onUpdateInbox,
 }: {
@@ -2516,6 +2691,8 @@ function DetailPanel({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
+
+  const newCheckIdRef = useRef<string | null>(null); // checklist: focus goes to the item just added
 
   if (!target) return null;
 
@@ -2627,7 +2804,9 @@ function DetailPanel({
   const setChecklist = (v: CheckItem[]) => updateField("checklist", v);
 
   const addCheckItem = () => {
-    setChecklist([...checklist, { id: `ci_${crypto.randomUUID()}`, text: "", done: false }]);
+    const id = `ci_${crypto.randomUUID()}`;
+    newCheckIdRef.current = id;
+    setChecklist([...checklist, { id, text: "", done: false }]);
   };
   const toggleCheckItem = (id: string) => {
     setChecklist(checklist.map((c) => c.id === id ? { ...c, done: !c.done } : c));
@@ -2639,11 +2818,11 @@ function DetailPanel({
     setChecklist(checklist.filter((c) => c.id !== id));
   };
 
-  const bg = darkMode ? '#2c2c2e' : 'white';
-  const border = darkMode ? '#3a3a3c' : '#e4e4e7';
-  const clr = darkMode ? '#e5e5e7' : '#18181b';
-  const textSec = darkMode ? '#a1a1a6' : '#71717a';
-  const inputBg = darkMode ? '#1c1c1e' : '#fafafa';
+  const bg = 'var(--pp-surface)';
+  const border = 'var(--pp-border)';
+  const clr = 'var(--pp-text)';
+  const textSec = 'var(--pp-text-muted)';
+  const inputBg = 'var(--pp-bg-subtle)';
 
   const doneCount = checklist.filter((c) => c.done).length;
   const totalCount = checklist.length;
@@ -2671,7 +2850,7 @@ function DetailPanel({
           </div>
           <button
             onClick={onClose}
-            style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${border}`, background: darkMode ? '#3a3a3c' : 'white', color: clr, fontSize: 14, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
+            style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${border}`, background: 'var(--pp-surface-raised)', color: clr, fontSize: 14, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
           >✕</button>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
@@ -2721,7 +2900,7 @@ function DetailPanel({
           </div>
 
           {totalCount > 0 && (
-            <div style={{ height: 3, borderRadius: 2, background: darkMode ? '#48484a' : '#e4e4e7', marginBottom: 10, overflow: "hidden" }}>
+            <div style={{ height: 3, borderRadius: 2, background: 'var(--pp-border-strong)', marginBottom: 10, overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${totalCount > 0 ? (doneCount / totalCount) * 100 : 0}%`, background: projColor, borderRadius: 2, transition: "width 0.2s" }} />
             </div>
           )}
@@ -2736,7 +2915,7 @@ function DetailPanel({
                   gap: 8,
                   padding: "6px 8px",
                   borderRadius: 8,
-                  background: ci.done ? (darkMode ? '#1c1c1e' : '#f9fafb') : "transparent",
+                  background: ci.done ? ('var(--pp-bg-panel)') : "transparent",
                 }}
               >
                 <input
@@ -2760,6 +2939,7 @@ function DetailPanel({
                   value={ci.text}
                   onChange={(e) => updateCheckText(ci.id, e.target.value)}
                   placeholder="…"
+                  autoFocus={ci.id === newCheckIdRef.current}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") {
                       e.preventDefault();
@@ -2975,6 +3155,16 @@ const [authError, setAuthError] = useState<string | null>(null);
 const [loadingAuth, setLoadingAuth] = useState(true);  
 
 const [loadingCloud, setLoadingCloud] = useState(false);
+const [cloudLoadFailed, setCloudLoadFailed] = useState(false);
+const [cloudReloadTick, setCloudReloadTick] = useState(0);
+const [cloudStatus, setCloudStatus] = useState<CloudStatus>("idle");
+const cloudRowRef = useRef<CloudRow | null>(null); // null = cloud not loaded yet -> never write
+const syncedKeyRef = useRef<string | null>(null); // cloudDataKey of what the cloud currently holds
+const conflictRef = useRef(false);
+const savingRef = useRef(false);
+const pendingSaveRef = useRef<PersistedStateV1 | null>(null);
+const userIdRef = useRef<string | null>(null);
+userIdRef.current = user?.id ?? null;
 const fileInputRef = useRef<HTMLInputElement | null>(null);
   const planWrapRef = useRef<HTMLDivElement | null>(null);
   const planHeaderRef = useRef<HTMLDivElement | null>(null);
@@ -3006,26 +3196,50 @@ const fileInputRef = useRef<HTMLInputElement | null>(null);
   };
 
   
-  const loadCloudState = async (userId: string): Promise<PersistedStateV1 | null> => {
+  const loadCloudState = async (userId: string): Promise<CloudLoadResult> => {
     const { data, error } = await supabase
       .from("planner_states")
-      .select("state")
+      .select("state, updated_at")
       .eq("user_id", userId)
       .maybeSingle();
 
     if (error) {
+      // Must stay distinguishable from "no row yet" – otherwise local data would overwrite the cloud
       console.error("Supabase load error:", error);
-      return null;
+      return { ok: false };
     }
-    return (data?.state as PersistedStateV1) ?? null;
+    return {
+      ok: true,
+      exists: !!data,
+      state: (data?.state as PersistedStateV1) ?? null,
+      updatedAt: data?.updated_at ?? null,
+    };
   };
 
-  const saveCloudState = async (userId: string, state: PersistedStateV1): Promise<void> => {
-    const { error } = await supabase
-      .from("planner_states")
-      .upsert({ user_id: userId, state, updated_at: new Date().toISOString() }, { onConflict: "user_id" });
+  const saveCloudState = async (userId: string, state: PersistedStateV1, expected: CloudRow): Promise<CloudSaveResult> => {
+    const updated_at = new Date().toISOString();
 
-    if (error) console.error("Supabase save error:", error);
+    if (!expected.exists) {
+      const { error } = await supabase.from("planner_states").insert({ user_id: userId, state, updated_at });
+      if (error) {
+        console.error("Supabase save error:", error);
+        // 23505 = unique violation: another device created the row in the meantime
+        return { ok: false, conflict: error.code === "23505" };
+      }
+      return { ok: true, updatedAt: updated_at };
+    }
+
+    let query = supabase.from("planner_states").update({ state, updated_at }).eq("user_id", userId);
+    query = expected.updatedAt === null ? query.is("updated_at", null) : query.eq("updated_at", expected.updatedAt);
+    const { data, error } = await query.select("updated_at");
+
+    if (error) {
+      console.error("Supabase save error:", error);
+      return { ok: false, conflict: false };
+    }
+    // No row matched -> someone else saved since we last loaded
+    if (!data || data.length === 0) return { ok: false, conflict: true };
+    return { ok: true, updatedAt: data[0].updated_at ?? updated_at };
   };
 
 const stored = readStored();
@@ -3034,24 +3248,27 @@ const stored = readStored();
     ps.map((p) => ({
       ...p,
       lanes: ensureAtLeastOneLane(
-        (p.lanes ?? []).map((l) => ({
-          ...l,
-          items: (l.items ?? []).map((it: any) => {
-            if (it?.type === "experiment") {
-              return { ...it, desc: it.desc ?? "", subTasks: it.subTasks ?? {} };
-            }
-            return it;
-          }),
-        }))
+        resolveLaneOverlaps(
+          (p.lanes ?? []).map((l) => ({
+            ...l,
+            items: (l.items ?? []).map((it: any) => {
+              if (it?.type === "experiment") {
+                return { ...it, desc: it.desc ?? "", subTasks: it.subTasks ?? {} };
+              }
+              return it;
+            }),
+          }))
+        )
       ),
     }));
 
-  // Mobile detection
-  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
+  // Mobile detection – narrow screens, plus phones turned sideways (wide but short)
+  const isMobileViewport = () => window.innerWidth < 768 || window.innerHeight < 500;
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && isMobileViewport());
   const [isLandscape, setIsLandscape] = useState(() => typeof window !== 'undefined' && window.innerWidth > window.innerHeight);
   useEffect(() => {
     const check = () => {
-      setIsMobile(window.innerWidth < 768);
+      setIsMobile(isMobileViewport());
       setIsLandscape(window.innerWidth > window.innerHeight);
     };
     window.addEventListener('resize', check);
@@ -3074,7 +3291,7 @@ const stored = readStored();
 
   const [windowLen, setWindowLen] = useState<5 | 7 | 14 | 28>(() => stored?.windowLen ?? 14);
   const [projects, setProjects] = useState<Project[]>(() =>
-    stored?.projects ? normalizeProjects(stored.projects) : seed(stored?.windowStart ?? windowStart)
+    stored?.projects ? normalizeProjects(stored.projects) : normalizeProjects(seed(stored?.windowStart ?? windowStart))
   );
 
   const [inbox, setInbox] = useState<InboxTask[]>(() => stored?.inbox ?? []);
@@ -3086,12 +3303,14 @@ const stored = readStored();
   const [cascadedProjects, setCascadedProjects] = useState<Record<string, boolean>>({});
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     const stored = localStorage.getItem("pmorph_darkmode");
+    // Set the class before the first paint – theme colors are CSS variables keyed on it
+    document.documentElement.classList.toggle("dark", stored === "true");
     return stored === "true";
   });
   const [archivedProjects, setArchivedProjects] = useState<Project[]>(() => (stored as any)?.archivedProjects ?? []);
   const [showArchive, setShowArchive] = useState<boolean>(false);
   const [closeConfirm, setCloseConfirm] = useState<string | null>(null); // projectId awaiting confirm
-  const [inboxOpen, setInboxOpen] = useState<boolean>(() => typeof window !== 'undefined' && window.innerWidth >= 768);
+  const [inboxOpen, setInboxOpen] = useState<boolean>(() => typeof window !== 'undefined' && !isMobileViewport());
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [planRecurringModal, setPlanRecurringModal] = useState(false);
   const [planRecForm, setPlanRecForm] = useState<{ 
@@ -3199,6 +3418,7 @@ useEffect(() => {
     inbox,
     completed,
     completedTasks,
+    collapsedProjects,
     ...(archivedProjects.length ? { archivedProjects } : {}),
     ...(planRecurring.length ? { planRecurring } : {}),
   } as any);
@@ -3236,25 +3456,94 @@ useEffect(() => {
     });
   };
 
+  const makeSnapshotRef = useRef(makeSnapshot);
+  makeSnapshotRef.current = makeSnapshot;
+
+  // Push state to the cloud. Saves run one at a time; a save requested meanwhile
+  // is queued (only the latest one), so each write sees the updated_at of the previous.
+  const pushCloud = async (state: PersistedStateV1): Promise<void> => {
+    const userId = userIdRef.current;
+    const row = cloudRowRef.current;
+    if (!userId || !row || conflictRef.current) return;
+    if (cloudDataKey(state) === syncedKeyRef.current) return; // nothing new (e.g. only navigation)
+    if (savingRef.current) {
+      pendingSaveRef.current = state;
+      return;
+    }
+
+    savingRef.current = true;
+    setCloudStatus("saving");
+    const res = await saveCloudState(userId, state, row);
+    savingRef.current = false;
+    if (userIdRef.current !== userId) return;
+
+    if (res.ok) {
+      cloudRowRef.current = { exists: true, updatedAt: res.updatedAt };
+      syncedKeyRef.current = cloudDataKey(state);
+      setCloudStatus("saved");
+      const next = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      if (next) await pushCloud(next);
+    } else {
+      pendingSaveRef.current = null;
+      if (res.conflict) conflictRef.current = true;
+      setCloudStatus(res.conflict ? "conflict" : "error");
+    }
+  };
+
+  // Conflict: keep this device's version and overwrite the cloud
+  const resolveConflictKeepMine = async () => {
+    const userId = userIdRef.current;
+    if (!userId) return;
+    const res = await loadCloudState(userId);
+    if (!res.ok) {
+      alert("Could not reach the cloud. Please try again.");
+      return;
+    }
+    cloudRowRef.current = { exists: res.exists, updatedAt: res.updatedAt };
+    syncedKeyRef.current = null;
+    conflictRef.current = false;
+    await pushCloud(makeSnapshotRef.current());
+  };
+
+  // Conflict: discard this device's changes and load the cloud version
+  const resolveConflictTakeCloud = () => {
+    conflictRef.current = false;
+    setCloudReloadTick((t) => t + 1);
+  };
+
   // After login: load planner state from Supabase (cloud)
   useEffect(() => {
+    cloudRowRef.current = null;
+    syncedKeyRef.current = null;
+    conflictRef.current = false;
+    pendingSaveRef.current = null;
+    setCloudStatus("idle");
+    setCloudLoadFailed(false);
     if (!user?.id) return;
+    const userId = user.id;
     let cancelled = false;
 
     (async () => {
       setLoadingCloud(true);
 
-      const cloud = await loadCloudState(user.id);
+      const cloud = await loadCloudState(userId);
 
       if (cancelled) return;
 
-      if (cloud && cloud.version === 1) {
-        // Use cloud state as source of truth
-        restoreSnapshot(cloud);
+      if (!cloud.ok || (cloud.exists && cloud.state?.version !== 1)) {
+        // We don't know what is in the cloud -> never upload anything, let the user retry
+        setCloudLoadFailed(true);
       } else {
-        // No cloud state yet -> upload current local snapshot once
-        const current = makeSnapshot();
-        await saveCloudState(user.id, current);
+        cloudRowRef.current = { exists: cloud.exists, updatedAt: cloud.updatedAt };
+        if (cloud.state) {
+          // Use cloud state as source of truth
+          syncedKeyRef.current = cloudDataKey(cloud.state);
+          restoreSnapshot(cloud.state);
+        } else {
+          // No cloud state yet -> upload current local snapshot once
+          await pushCloud(makeSnapshot());
+        }
       }
 
       if (!cancelled) setLoadingCloud(false);
@@ -3262,6 +3551,52 @@ useEffect(() => {
 
     return () => {
       cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, cloudReloadTick]);
+
+  // When the tab comes back to the foreground, pick up changes made on other devices
+  useEffect(() => {
+    if (!user?.id) return;
+    const userId = user.id;
+    let checking = false;
+
+    const onVisible = async () => {
+      if (document.visibilityState !== "visible" || checking) return;
+      if (!cloudRowRef.current || savingRef.current || conflictRef.current) return;
+      checking = true;
+      try {
+        const cloud = await loadCloudState(userId);
+        const row = cloudRowRef.current;
+        if (!cloud.ok || !row || userIdRef.current !== userId || savingRef.current || conflictRef.current) return;
+        if (!cloud.exists || cloud.updatedAt === row.updatedAt || cloud.state?.version !== 1) return;
+
+        const local = makeSnapshotRef.current();
+        if (cloudDataKey(local) === syncedKeyRef.current) {
+          // No unsynced local changes -> take the newer cloud data, keep this device's navigation
+          cloudRowRef.current = { exists: true, updatedAt: cloud.updatedAt };
+          syncedKeyRef.current = cloudDataKey(cloud.state);
+          restoreSnapshot({
+            ...cloud.state,
+            windowStart: local.windowStart,
+            windowLen: local.windowLen,
+            viewMode: local.viewMode,
+            calendarDaysLen: local.calendarDaysLen,
+          });
+        } else {
+          conflictRef.current = true;
+          setCloudStatus("conflict");
+        }
+      } finally {
+        checking = false;
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
@@ -3288,6 +3623,9 @@ useEffect(() => {
   // Keyboard shortcut: Ctrl+Z = undo, Ctrl+Shift+Z / Ctrl+Y = redo
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // While typing, Ctrl+Z belongs to the text field
+      const el = e.target as HTMLElement | null;
+      if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable) return;
       if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
         e.preventDefault();
         performUndo();
@@ -3327,9 +3665,7 @@ useEffect(() => {
       setSavedAt(new Date());
 
       // Also sync to cloud (debounced by this 500ms autosave timer)
-      if (user?.id) {
-        void saveCloudState(user.id, current);
-      }
+      void pushCloud(current);
 }, 500);
     return () => window.clearTimeout(t);
   }, [windowStart, windowLen, viewMode, calendarDaysLen, projects, timedEvents, recurring, planRecurring, inbox, completed, collapsedProjects, archivedProjects, completedTasks]);
@@ -3370,8 +3706,10 @@ useEffect(() => {
 
     // Timed events (tasks with time in calendar)
     for (const ev of Object.values(timedEvents)) {
+      if (!isLiveEvent(ev.id)) continue;
       const taskRef = taskCatalog.find((t) => t.id === ev.id);
-      const title = taskRef?.title ?? ev.id;
+      const ruleRef = planRecurring.find((r) => ev.id.startsWith(`pr:${r.id}:`));
+      const title = taskRef?.title ?? (ruleRef ? `↻ ${ruleRef.title}` : ev.id);
       const d = dayToDate(ev.day);
       const start = `${d}T${minToHHMM(ev.startMin)}`;
       const end   = `${d}T${minToHHMM(ev.endMin)}`;
@@ -3380,13 +3718,11 @@ useEffect(() => {
     }
 
     // Recurring calendar events (for next 90 days)
-    const today = new Date();
+    const next90 = Array.from({ length: 90 }, (_, i) => addDays(todayUTC(), i));
     for (const r of recurring) {
-      for (let i = 0; i < 90; i++) {
-        const dt = new Date(today);
-        dt.setUTCDate(dt.getUTCDate() + i);
-        if (dt.getUTCDay() !== r.weekday) continue;
-        const d = dt.toISOString().slice(0, 10).replace(/-/g, "");
+      for (const day of next90) {
+        if (parseDay(day).getUTCDay() !== r.weekday) continue;
+        const d = dayToDate(day);
         const start = `${d}T${minToHHMM(r.startMin)}`;
         const end   = `${d}T${minToHHMM(r.endMin)}`;
         const uid   = `${r.id}-${d}@pmorph`;
@@ -3401,9 +3737,9 @@ useEffect(() => {
           if (it.type !== "task") continue;
           const evtId = `t:${p.id}:${it.id}`;
           if (timedEvents[evtId]) continue; // already exported with time
-          const d = dayToDate(it.start);
           const uid = `${it.id}@pmorph`;
-          lines.push("BEGIN:VEVENT", `UID:${uid}`, `DTSTART;VALUE=DATE:${d}`, `DTEND;VALUE=DATE:${d}`, `SUMMARY:${escICS(it.title)}`, `CATEGORIES:${escICS(p.name)}`, "END:VEVENT");
+          // All-day DTEND is exclusive -> day after the task's last day
+          lines.push("BEGIN:VEVENT", `UID:${uid}`, `DTSTART;VALUE=DATE:${dayToDate(it.start)}`, `DTEND;VALUE=DATE:${dayToDate(addDays(it.end, 1))}`, `SUMMARY:${escICS(it.title)}`, `CATEGORIES:${escICS(p.name)}`, "END:VEVENT");
         }
       }
     }
@@ -3411,13 +3747,13 @@ useEffect(() => {
     // Plan recurring (next 90 days)
     for (const r of planRecurring) {
       const proj = projects.find((p) => p.id === r.projectId);
-      for (let i = 0; i < 90; i++) {
-        const dt = new Date(today);
-        dt.setUTCDate(dt.getUTCDate() + i);
-        if (dt.getUTCDay() !== r.weekday) continue;
-        const d = dt.toISOString().slice(0, 10).replace(/-/g, "");
+      if (!proj) continue;
+      for (const day of next90) {
+        if (!planRecurringMatches(r, day)) continue;
+        if (timedEvents[`pr:${r.id}:${day}`]) continue; // already exported with time
+        const d = dayToDate(day);
         const uid = `${r.id}-${d}@pmorph`;
-        lines.push("BEGIN:VEVENT", `UID:${uid}`, `DTSTART;VALUE=DATE:${d}`, `DTEND;VALUE=DATE:${d}`, `SUMMARY:↻ ${escICS(r.title)}`, `CATEGORIES:${escICS(proj?.name ?? "")}`, "END:VEVENT");
+        lines.push("BEGIN:VEVENT", `UID:${uid}`, `DTSTART;VALUE=DATE:${d}`, `DTEND;VALUE=DATE:${dayToDate(addDays(day, 1))}`, `SUMMARY:↻ ${escICS(r.title)}`, `CATEGORIES:${escICS(proj.name)}`, "END:VEVENT");
       }
     }
 
@@ -3436,6 +3772,15 @@ useEffect(() => {
     // will hide the app and show the PrintView component
     window.print();
   };
+
+  // ---- MORNING E-MAIL PREVIEW ----
+  // Same rendering the scheduled e-mail will use, shown for any day
+  const [emailPreviewDay, setEmailPreviewDay] = useState<DayKey | null>(null);
+  const emailPreview = useMemo(() => {
+    if (!emailPreviewDay) return null;
+    const agenda = buildDailyAgenda({ projects, timedEvents, recurring, planRecurring, completedTasks }, emailPreviewDay);
+    return renderAgendaEmail(agenda, { appUrl: window.location.origin });
+  }, [emailPreviewDay, projects, timedEvents, recurring, planRecurring, completedTasks]);
 
   // ---- SHARE URL ----
   const [shareModalOpen, setShareModalOpen] = useState(false);
@@ -3470,7 +3815,7 @@ useEffect(() => {
       wrapper.style.position = 'absolute';
       wrapper.style.left = '-9999px';
       wrapper.style.top = '0';
-      wrapper.style.background = darkMode ? '#1c1c1e' : '#fafafa';
+      wrapper.style.background = 'var(--pp-bg-subtle)';
       wrapper.style.padding = '16px';
       document.body.appendChild(wrapper);
       
@@ -3487,7 +3832,7 @@ useEffect(() => {
       wrapper.appendChild(planClone);
       
       const canvas = await html2canvas(wrapper, { 
-        backgroundColor: darkMode ? '#1c1c1e' : '#fafafa',
+        backgroundColor: 'var(--pp-bg-subtle)',
         scale: 2,
         useCORS: true,
         logging: false,
@@ -3581,9 +3926,12 @@ useEffect(() => {
     [windowStart, windowLen]
   );
 
+  // A phone in portrait fits at most 3 day columns; the saved preference stays for wider screens
+  const maxCalDays = isMobile && !isLandscape ? 3 : 7;
+  const calDaysLen = Math.min(calendarDaysLen, maxCalDays) as 1 | 2 | 3 | 5 | 7;
   const calDays = useMemo(
-    () => Array.from({ length: calendarDaysLen }, (_, i) => addDays(windowStart, i)),
-    [windowStart, calendarDaysLen]
+    () => Array.from({ length: calDaysLen }, (_, i) => addDays(windowStart, i)),
+    [windowStart, calDaysLen]
   );
 
   // Expand planRecurring into per-day virtual task items for plan view display
@@ -3592,35 +3940,8 @@ useEffect(() => {
     for (const r of planRecurring) {
       const proj = projects.find((p) => p.id === r.projectId);
       if (!proj) continue;
-      const rType = r.recurrenceType || "weekly"; // backward compat
       for (const day of days) {
-        const dt = parseDay(day);
-        let match = false;
-        if (rType === "weekly") {
-          match = dt.getUTCDay() === r.weekday;
-        } else if (rType === "everyN" && r.everyNDays && r.everyNDays > 0 && r.startDate) {
-          const start = parseDay(r.startDate);
-          const diff = Math.round((dt.getTime() - start.getTime()) / 86400000);
-          match = diff >= 0 && diff % r.everyNDays === 0;
-        } else if (rType === "biweekly" && r.startDate) {
-          // Every 2nd occurrence of this weekday, anchored from startDate
-          if (dt.getUTCDay() === r.weekday) {
-            const start = parseDay(r.startDate);
-            const diff = Math.round((dt.getTime() - start.getTime()) / 86400000);
-            const weeks = Math.floor(diff / 7);
-            match = diff >= 0 && weeks % 2 === 0;
-          }
-        } else if (rType === "monthlyDate" && r.monthDay) {
-          match = dt.getUTCDate() === r.monthDay;
-        } else if (rType === "monthlyLast") {
-          // Last [weekday] of the month
-          if (dt.getUTCDay() === r.weekday) {
-            const lastDay = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth() + 1, 0));
-            const diff = lastDay.getUTCDate() - dt.getUTCDate();
-            match = diff < 7; // within last 7 days = last occurrence
-          }
-        }
-        if (match && !(r.skippedDates ?? []).includes(day)) {
+        if (planRecurringMatches(r, day)) {
           out.push({ id: `pr:${r.id}:${day}`, title: r.title, day, projectId: r.projectId, color: proj.color, recurringId: r.id });
         }
       }
@@ -3655,6 +3976,8 @@ useEffect(() => {
   const inboxTasks = useMemo(() => {
     const visible = taskCatalog.filter((t) => calDays.includes(t.day));
     return visible.filter((t) => {
+      // Recurring tasks with "8:00-8:30" in the title already sit in the time grid
+      if (t.meta?.isPlanRecurring && parseTimeRange(t.title)) return false;
       const ev = timedEvents[t.id];
       if (!ev) return true;
       if (!calDays.includes(ev.day)) return true;
@@ -3663,13 +3986,27 @@ useEffect(() => {
     });
   }, [taskCatalog, timedEvents, calDays]);
 
+  // A timed event is shown/exported only while its task still exists
+  // (deleted tasks or archived projects would otherwise leave "ghost" events)
+  const isLiveEvent = useMemo(() => {
+    const catalogIds = new Set(taskCatalog.map((t) => t.id));
+    return (id: string): boolean => {
+      if (catalogIds.has(id)) return true;
+      if (!id.startsWith("pr:")) return false;
+      // Plan-recurring instance outside the plan window: "pr:<ruleId>:<day>"
+      const day = id.slice(id.lastIndexOf(":") + 1);
+      const rule = planRecurring.find((r) => id === `pr:${r.id}:${day}`);
+      return !!rule && projects.some((p) => p.id === rule.projectId) && planRecurringMatches(rule, day);
+    };
+  }, [taskCatalog, planRecurring, projects]);
+
   const eventsForCal = useMemo(() => {
-    return Object.values(timedEvents).filter((e) => calDays.includes(e.day));
-  }, [timedEvents, calDays]);
+    return Object.values(timedEvents).filter((e) => calDays.includes(e.day) && isLiveEvent(e.id));
+  }, [timedEvents, calDays, isLiveEvent]);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 6 } })
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 8 } })
   );
 
   const collisionDetection = (args: any) => {
@@ -3941,6 +4278,9 @@ useEffect(() => {
       next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
       return next;
     });
+    // Open its popover so the new experiment can be named right away
+    skipNextDeselectRef.current = true;
+    setSelection({ kind: "item", projectId, itemId: item.id });
   }
 
   function addExperimentSubTask(projectId: string, laneId: string, experimentId: string, day: DayKey) {
@@ -4054,8 +4394,7 @@ useEffect(() => {
         for (const r of planRecurring) {
           if (r.projectId !== project.id) continue;
           for (const day of days) {
-            const dt = parseDay(day);
-            if (dt.getUTCDay() === r.weekday) {
+            if (planRecurringMatches(r, day)) {
               virtualRecurring.push({
                 id: `virt_pr_${r.id}_${day}`,
                 type: "task",
@@ -4118,8 +4457,7 @@ useEffect(() => {
         for (const r of planRecurring) {
           if (r.projectId !== project.id) continue;
           for (const day of days) {
-            const dt = parseDay(day);
-            if (dt.getUTCDay() === r.weekday) {
+            if (planRecurringMatches(r, day)) {
               virtualRecurring.push({
                 id: `virt_pr_${r.id}_${day}`,
                 type: "task",
@@ -4223,7 +4561,8 @@ useEffect(() => {
 
   function startRange(projectId: string, laneId: string, day: DayKey, pointerId: number) {
     if (resizeExp) return;
-    setSelection(null);
+    // With something selected (its popover open), a click on empty space only closes it
+    if (selection) { setSelection(null); return; }
     setDragCreate({ projectId, laneId, startDay: day, currentDay: day, pointerId, moved: false });
   }
 
@@ -4329,6 +4668,14 @@ useEffect(() => {
       if (pIdx === -1) return prev;
       next[pIdx] = deleteItemFromProject(next[pIdx], itemId);
       return next;
+    });
+    // Drop calendar events of the task (t:...) or of the experiment's sub-tasks (st:...)
+    setTimedEvents((prev) => {
+      const ids = Object.keys(prev).filter((id) => id === `t:${projectId}:${itemId}` || id.startsWith(`st:${projectId}:${itemId}:`));
+      if (!ids.length) return prev;
+      const n = { ...prev };
+      for (const id of ids) delete n[id];
+      return n;
     });
     setSelection((s) => (s && s.kind === "item" && s.projectId === projectId && s.itemId === itemId ? null : s));
   }
@@ -4515,6 +4862,15 @@ useEffect(() => {
     return () => window.removeEventListener("make-recurring", handler);
   }, [planRecurring]);
 
+  // A gesture taken over by the browser (e.g. scrolling) must not leave a half-made range behind
+  useEffect(() => {
+    if (!dragCreate) return;
+    const pid = dragCreate.pointerId;
+    const cancel = (e: PointerEvent) => { if (e.pointerId === pid) setDragCreate(null); };
+    window.addEventListener("pointercancel", cancel, true);
+    return () => window.removeEventListener("pointercancel", cancel, true);
+  }, [dragCreate?.pointerId]);
+
   useEffect(() => {
     if (!resizeExp) return;
     const pid = resizeExp.pointerId;
@@ -4549,9 +4905,8 @@ useEffect(() => {
         }
       }
       // Add planRecurring instances for this project on this day
-      const dt2 = parseDay(dayFocus);
       for (const r of planRecurring) {
-        if (r.projectId === p.id && dt2.getUTCDay() === r.weekday) {
+        if (r.projectId === p.id && planRecurringMatches(r, dayFocus)) {
           const tr = parseTimeRange(r.title);
           const timeStr = tr ? ` (${String(Math.floor(tr.startMin/60)).padStart(2,"0")}:${String(tr.startMin%60).padStart(2,"0")}–${String(Math.floor(tr.endMin/60)).padStart(2,"0")}:${String(tr.endMin%60).padStart(2,"0")})` : "";
           rows.push({ id: `pr:${r.id}:${dayFocus}`, title: `↻ ${r.title}${timeStr}`, kind: "task", meta: { isPlanRecurring: true } });
@@ -4639,8 +4994,46 @@ useEffect(() => {
     return <div style={{ padding: 16 }}>Loading planner…</div>;
   }
 
+  if (cloudLoadFailed) {
+    return (
+      <div style={{ padding: 16, maxWidth: 420 }}>
+        <h2 style={{ marginBottom: 8 }}>Could not load your planner from the cloud</h2>
+        <p style={{ marginBottom: 12 }}>Nothing was overwritten. Check your connection and try again.</p>
+        <button className="rounded-xl border px-3 py-2 text-sm shadow-sm" onClick={() => setCloudReloadTick((t) => t + 1)}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+
   return (
     <>
+      {(cloudStatus === "conflict" || cloudStatus === "error") && (
+        <div
+          data-print-hide
+          style={{
+            position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 10000,
+            maxWidth: "calc(100vw - 32px)", padding: "8px 12px", borderRadius: 12, fontSize: 14,
+            display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+            boxShadow: "0 4px 16px rgba(0,0,0,0.15)",
+            background: cloudStatus === "conflict" ? "#fef3c7" : "#fee2e2",
+            color: cloudStatus === "conflict" ? "#78350f" : "#7f1d1d",
+          }}
+        >
+          {cloudStatus === "conflict" ? (
+            <>
+              <span>The planner was changed on another device. Sync is paused.</span>
+              <button className="rounded-lg border px-2 py-1 bg-white" onClick={resolveConflictTakeCloud}>Load newer version</button>
+              <button className="rounded-lg border px-2 py-1 bg-white" onClick={() => { void resolveConflictKeepMine(); }}>Keep mine (overwrite)</button>
+            </>
+          ) : (
+            <>
+              <span>Cloud save failed. Changes are kept on this device only.</span>
+              <button className="rounded-lg border px-2 py-1 bg-white" onClick={() => { void pushCloud(makeSnapshot()); }}>Retry</button>
+            </>
+          )}
+        </div>
+      )}
       <style>{`
         /* ===== DARK MODE OVERRIDES ===== */
         .dark .dm-surface { background: #1c1c1e !important; }
@@ -4675,12 +5068,12 @@ useEffect(() => {
         data-app-interactive
         className={isMobile ? "h-screen overflow-hidden p-2" : "h-screen overflow-hidden p-6"}
         style={({ 
-          background: darkMode ? '#1c1c1e' : '#fafafa', 
-          color: darkMode ? '#e5e5e7' : '#18181b',
-          '--cell-bg': darkMode ? '#2c2c2e' : 'white',
-          '--cell-border': darkMode ? '#3a3a3c' : '#e4e4e7',
-          '--today-bg': darkMode ? 'rgba(56, 100, 180, 0.25)' : 'rgba(191, 219, 254, 0.6)',
-          '--weekend-bg': darkMode ? 'rgba(160, 60, 60, 0.15)' : 'rgba(254, 202, 202, 0.4)',
+          background: 'var(--pp-bg-subtle)', 
+          color: 'var(--pp-text)',
+          '--cell-bg': 'var(--pp-surface)',
+          '--cell-border': 'var(--pp-border)',
+          '--today-bg': 'var(--pp-today-highlight)',
+          '--weekend-bg': 'var(--pp-weekend-col-strong)',
         } as any)}
         onClick={() => { 
           if (skipNextDeselectRef.current) { skipNextDeselectRef.current = false; return; }
@@ -4690,72 +5083,74 @@ useEffect(() => {
       <DndContext sensors={sensors} collisionDetection={collisionDetection} onDragEnd={onDragEnd}>
       <div className="mx-auto flex h-full max-w-[1500px] flex-col">
         {/* Sticky top bar */}
-        <div className={isMobile ? "sticky top-0 z-50 pb-1" : "sticky top-0 z-50 pb-4"} style={{ background: darkMode ? '#1c1c1e' : '#fafafa' }}>
+        <div className={isMobile ? "sticky top-0 z-50 pb-1" : "sticky top-0 z-50 pb-4"} style={{ background: 'var(--pp-bg-subtle)' }}>
           {isMobile ? (
           <div data-print-hide>
             {isLandscape ? (
             /* Mobile landscape: single row */
             <div className="flex items-center gap-1 flex-wrap">
-              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
                 {(["plan", "calendar", "agenda"] as const).map((v) => (
                   <button key={v} className="rounded-lg px-2 py-1 text-xs hover:opacity-80"
-                    style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={viewMode === v ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
                     onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}</button>
                 ))}
               </div>
               <div className="flex items-center gap-0.5">
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀◀</button>
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
-                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶▶</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀︎◀︎</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎</button>
+                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶︎</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶︎▶︎</button>
               </div>
-              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', display: viewMode === "calendar" ? "none" : undefined }}>
                 {([5, 7, 14, 28] as const).map((n) => (
                   <button key={n} className="rounded-lg px-1.5 py-1 text-xs hover:opacity-80"
-                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={windowLen === n ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
                     onClick={() => setWindowLen(n as any)}>{n}</button>
                 ))}
               </div>
               <button className="rounded-xl border px-2.5 py-1 text-xs font-semibold shadow-sm" style={{ background: '#2563eb', color: 'white', borderColor: '#1d4ed8' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
-              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>📥</button>
-              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀️" : "🌙"}</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => performUndo()} title="Undo">↶︎</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setInboxOpen((v) => !v)}>📥</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀️" : "🌙"}</button>
               {archivedProjects.length > 0 && (
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text-muted)' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
               )}
             </div>
             ) : (
             /* Mobile portrait: two rows */
             <>
             <div className="flex items-center gap-1 mb-1">
-              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
                 {(["plan", "calendar", "agenda"] as const).map((v) => (
                   <button key={v} className="rounded-lg px-2 py-1 text-xs hover:opacity-80"
-                    style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={viewMode === v ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
                     onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}</button>
                 ))}
               </div>
               <div className="flex items-center gap-0.5">
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀◀</button>
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
-                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶▶</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀︎◀︎</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎</button>
+                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶︎</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶︎▶︎</button>
               </div>
             </div>
             <div className="flex items-center gap-1">
-              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', display: viewMode === "calendar" ? "none" : undefined }}>
                 {([5, 7, 14, 28] as const).map((n) => (
                   <button key={n} className="rounded-lg px-1.5 py-1 text-xs hover:opacity-80"
-                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={windowLen === n ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
                     onClick={() => setWindowLen(n as any)}>{n}</button>
                 ))}
               </div>
               <button className="rounded-xl border px-2.5 py-1 text-xs font-semibold shadow-sm" style={{ background: '#2563eb', color: 'white', borderColor: '#1d4ed8' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
-              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>📥</button>
-              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀️" : "🌙"}</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => performUndo()} title="Undo">↶︎</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setInboxOpen((v) => !v)}>📥</button>
+              <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀️" : "🌙"}</button>
               {archivedProjects.length > 0 && (
-                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
+                <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text-muted)' }} onClick={() => setShowArchive((v) => !v)}>📦</button>
               )}
             </div>
             </>
@@ -4765,40 +5160,42 @@ useEffect(() => {
           ) : (
           <div className="flex items-center gap-1.5 flex-wrap" data-print-hide>
               {/* Desktop: View mode toggle */}
-              <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
                 {(["plan", "calendar", "agenda"] as const).map((v) => (
                   <button key={v} className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
-                    style={viewMode === v ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={viewMode === v ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { background: 'var(--pp-surface)', color: 'var(--pp-text)' }}
                     onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Calendar" : "Agenda"}</button>
                 ))}
               </div>
               {/* Desktop: Navigation */}
               <div className="flex items-center gap-0.5">
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{`◀︎ -${windowLen}`}</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{`+${windowLen} ▶︎`}</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{`◀︎ -${windowLen}`}</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶︎</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{`+${windowLen} ▶︎`}</button>
               </div>
-              {/* Desktop: Window length toggle */}
-              <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              {/* Desktop: Window length toggle (the calendar has its own "Days" switch) */}
+              <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', display: viewMode === "calendar" ? "none" : undefined }}>
                 {([7, 14, 28] as const).map((n) => (
                   <button key={n} className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
-                    style={windowLen === n ? { background: darkMode ? '#e5e5e7' : '#18181b', color: darkMode ? '#1c1c1e' : 'white' } : { background: darkMode ? '#2c2c2e' : 'white', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={windowLen === n ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { background: 'var(--pp-surface)', color: 'var(--pp-text)' }}
                     onClick={() => setWindowLen(n)}>{n === 28 ? "4 weeks" : `${n} days`}</button>
                 ))}
               </div>
               {/* Desktop: Actions */}
-              <button className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm" style={{ background: darkMode ? '#3b82f6' : '#2563eb', color: 'white', borderColor: darkMode ? '#2563eb' : '#1d4ed8' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => fileInputRef.current?.click()}>Import</button>
+              <button className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm" style={{ background: 'var(--pp-primary)', color: 'white', borderColor: 'var(--pp-primary-hover)' }} onClick={() => { if (projects.length === 0) addProject(); setAddTaskModal(true); }}>+ Task</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => performUndo()} title="Undo (Ctrl+Z)">↶︎</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => exportJSON()} title="Export as JSON">Export</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => exportICS()} title="Export to Google Calendar / Outlook">ICS</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setEmailPreviewDay(todayUTC())} title="Preview of the morning agenda e-mail">Email</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => fileInputRef.current?.click()}>Import</button>
               <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.currentTarget.value = ""; }} />
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setInboxOpen((v) => !v)}>Inbox</button>
-              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDarkMode((v) => !v)} title={darkMode ? "Light mode" : "Dark mode"}>{darkMode ? "☀️" : "🌙"}</button>
-              {savedAt && (<span className="text-xs" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>saved {savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>)}
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setInboxOpen((v) => !v)}>Inbox</button>
+              <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setDarkMode((v) => !v)} title={darkMode ? "Light mode" : "Dark mode"}>{darkMode ? "☀️" : "🌙"}</button>
+              {savedAt && (<span className="text-xs" style={{ color: 'var(--pp-text-faint)' }}>{cloudStatus === "saving" ? "syncing…" : `saved ${savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}</span>)}
               {archivedProjects.length > 0 && (
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#71717a' }} onClick={() => setShowArchive((v) => !v)} title="Archived projects">{`Archive (${archivedProjects.length})`}</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text-muted)' }} onClick={() => setShowArchive((v) => !v)} title="Archived projects">{`Archive (${archivedProjects.length})`}</button>
               )}
           </div>
           )}
@@ -4852,7 +5249,7 @@ useEffect(() => {
             <div
               ref={planWrapRef}
               className="min-h-0 flex-1 overflow-auto rounded-2xl border shadow-sm"
-              style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}
+              style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}
             >
               <div>
 
@@ -4861,7 +5258,7 @@ useEffect(() => {
                     ref={planHeaderRef}
                     data-date-header
                     className="sticky top-0 z-20 flex"
-                    style={{ width: days.length * cellW, background: darkMode ? '#2c2c2e' : 'white' }}
+                    style={{ width: days.length * cellW, background: 'var(--pp-surface)' }}
                   >
                     {days.map((d) => {
                       const { weekday, md } = dayLabel(d);
@@ -4875,15 +5272,15 @@ useEffect(() => {
                           style={{ 
                             width: cellW, minWidth: cellW, maxWidth: cellW, flexShrink: 0, flexGrow: 0,
                             padding: "6px 4px",
-                            borderColor: darkMode ? '#3a3a3c' : '#e4e4e7',
-                            background: isToday ? (darkMode ? 'rgba(56, 100, 180, 0.25)' : '#eff6ff') : isWeekend ? (darkMode ? 'rgba(160, 60, 60, 0.15)' : 'rgba(254, 226, 226, 0.6)') : (darkMode ? '#2c2c2e' : 'white'),
+                            borderColor: 'var(--pp-border)',
+                            background: isToday ? ('var(--pp-today-bg-strong)') : isWeekend ? ('var(--pp-weekend-bg-strong)') : ('var(--pp-surface)'),
                             boxSizing: 'border-box',
                           }}
                           onClick={(e) => { e.stopPropagation(); setDayFocus(d); }}
                           title="Click = task list for day"
                         >
-                          <div className="text-xs font-medium" style={{ color: isToday ? (darkMode ? '#93bbfd' : '#2563eb') : isWeekend ? (darkMode ? '#f87171' : '#dc2626') : (darkMode ? '#a1a1a6' : '#3f3f46'), fontWeight: isToday ? 700 : 500 }}>{weekday}</div>
-                          <div className="text-xs font-medium" style={{ color: isToday ? (darkMode ? '#60a5fa' : '#3b82f6') : isWeekend ? (darkMode ? '#f87171' : '#ef4444') : (darkMode ? '#8e8e93' : '#71717a') }}>
+                          <div className="text-xs font-medium" style={{ color: isToday ? ('var(--pp-accent)') : isWeekend ? ('var(--pp-danger-strong)') : ('var(--pp-text-label)'), fontWeight: isToday ? 700 : 500 }}>{weekday}</div>
+                          <div className="text-xs font-medium" style={{ color: isToday ? ('var(--pp-accent-soft)') : isWeekend ? ('var(--pp-danger)') : ('var(--pp-icon)') }}>
                             {isToday ? <span className="inline-block rounded-full bg-blue-500 text-white px-1.5">{md}</span> : md}
                           </div>
                         </div>
@@ -4939,8 +5336,8 @@ useEffect(() => {
                   {projectsWithRecurring.length === 0 && (
                     <div className="flex flex-col items-center justify-center py-16 px-4">
                       <div className="text-4xl mb-3">🌱</div>
-                      <div className="text-sm font-medium mb-1" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>No projects yet</div>
-                      <div className="text-xs mb-4 text-center" style={{ color: darkMode ? '#8e8e93' : '#a1a1aa' }}>Create your first project to start planning.</div>
+                      <div className="text-sm font-medium mb-1" style={{ color: 'var(--pp-text)' }}>No projects yet</div>
+                      <div className="text-xs mb-4 text-center" style={{ color: 'var(--pp-icon-faint)' }}>Create your first project to start planning.</div>
                       <button
                         className="rounded-xl border px-4 py-2 text-sm font-semibold shadow-sm"
                         style={{ background: '#2563eb', color: 'white', borderColor: '#1d4ed8' }}
@@ -4954,51 +5351,51 @@ useEffect(() => {
                     <div key={project.id}>
                       {/* Project header */}
                       <div
-                        className={`flex items-center ${isMobile ? 'gap-1 px-1 py-1' : 'gap-2 px-3 py-2'} border-b dm-project-header`}
-                        style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}
+                        className={`flex items-center ${isMobile ? 'gap-1 px-1 py-0.5' : 'gap-2 px-3 py-1'} border-b dm-project-header`}
+                        style={{ borderColor: 'var(--pp-hover)' }}
                       >
-                        {/* Reorder buttons — vertical, hidden on mobile */}
+                        {/* Reorder buttons — hidden on mobile */}
                         {!isMobile && (
-                        <div className="flex flex-col flex-shrink-0 gap-0.5">
+                        <div className="flex flex-shrink-0">
                           <button
-                            className="h-5 w-5 rounded text-center text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100 leading-none text-[10px]"
+                            className="flex h-5 w-5 items-center justify-center rounded text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100"
                             onClick={(e) => { e.stopPropagation(); moveProject(project.id, "up"); }}
                             title="Move project up"
-                          >▲</button>
+                          ><Icon name="chevron-up" size={12} /></button>
                           <button
-                            className="h-5 w-5 rounded text-center text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100 leading-none text-[10px]"
+                            className="flex h-5 w-5 items-center justify-center rounded text-zinc-300 hover:text-zinc-600 hover:bg-zinc-100"
                             onClick={(e) => { e.stopPropagation(); moveProject(project.id, "down"); }}
                             title="Move project down"
-                          >▼</button>
+                          ><Icon name="chevron-down" size={12} /></button>
                         </div>
                         )}
                         <button
-                          className="flex-shrink-0 w-4 text-center text-zinc-400 hover:text-zinc-700"
-                          style={{ transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)", transition: "transform 0.15s", fontSize: 14 }}
+                          className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-zinc-400 hover:text-zinc-700"
+                          style={{ transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)", transition: "transform 0.15s" }}
                           onClick={(e) => {
                             e.stopPropagation();
                             setCollapsedProjects((prev) => ({ ...prev, [project.id]: !prev[project.id] }));
                           }}
                           title={isCollapsed ? "Expand project" : "Collapse project"}
                         >
-                          ▾
+                          <Icon name="chevron-down" />
                         </button>
                         <button
-                          className={"flex-shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold " + (cascadedProjects[project.id] ? "bg-blue-100 text-blue-600" : "text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100")}
+                          className={"flex h-5 w-6 flex-shrink-0 items-center justify-center rounded " + (cascadedProjects[project.id] ? "bg-blue-100 text-blue-600" : "text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100")}
                           onClick={(e) => {
                             e.stopPropagation();
                             toggleCascade(project.id);
                           }}
                           title={cascadedProjects[project.id] ? "Switch to compact view" : "Sort lanes into cascade (Gantt)"}
                         >
-                          ⚡
+                          <Icon name="cascade" />
                         </button>
                         <button
-                          className="text-xs text-zinc-400 hover:text-zinc-700"
+                          className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100"
                           onClick={(e) => { e.stopPropagation(); setDetailTarget({ kind: "project", projectId: project.id }); }}
                           title="Project notes & checklist"
                         >
-                          📝
+                          <Icon name="note" />
                         </button>
                         <input
                           type="color"
@@ -5018,7 +5415,7 @@ useEffect(() => {
                           title="Change project color"
                         />
                         <input
-                          className="flex-1 bg-transparent text-sm font-semibold outline-none"
+                          className="min-w-0 flex-1 bg-transparent text-sm font-semibold outline-none"
                           value={project.name}
                           onChange={(e) => updateProjectName(project.id, e.target.value)}
                           onBlur={(e) => {
@@ -5027,30 +5424,32 @@ useEffect(() => {
                           onClick={(e) => e.stopPropagation()}
                           onPointerDown={(e) => e.stopPropagation()}
                         />
-                        {!isCollapsed && (
+                        {!isCollapsed && closeConfirm !== project.id && (
                           <button
-                            className="text-xs text-zinc-400 hover:text-zinc-700"
+                            className="flex-shrink-0 whitespace-nowrap text-xs text-zinc-400 hover:text-zinc-700"
                             onClick={(e) => { e.stopPropagation(); addLane(project.id); }}
                             title="Add lane"
                           >
                             + lane
                           </button>
                         )}
+                        {closeConfirm !== project.id && (
                         <button
-                          className="text-xs text-zinc-400 hover:text-zinc-700"
+                          className="flex-shrink-0 whitespace-nowrap text-xs text-zinc-400 hover:text-zinc-700"
                           onClick={(e) => { e.stopPropagation(); addProject(); }}
                           title="Add new project"
                         >
                           + project
                         </button>
+                        )}
                         {/* Close / remove project button */}
                         {closeConfirm === project.id ? (
                           <div
-                            className="flex items-center gap-1 ml-2"
+                            className="flex flex-shrink-0 items-center gap-1 ml-2"
                             onClick={(e) => e.stopPropagation()}
                             onPointerDown={(e) => e.stopPropagation()}
                           >
-                            <span className="text-xs text-zinc-500">Archive content?</span>
+                            {!isMobile && <span className="text-xs text-zinc-500">Archive content?</span>}
                             <button
                               className="rounded-lg border border-zinc-200 bg-white px-2 py-0.5 text-xs hover:bg-zinc-50 text-zinc-700"
                               onClick={(e) => {
@@ -5083,7 +5482,7 @@ useEffect(() => {
                           </div>
                         ) : (
                           <button
-                            className="ml-2 flex-shrink-0 text-zinc-300 hover:text-red-400 transition-colors"
+                            className="ml-1 flex h-6 w-6 flex-shrink-0 items-center justify-center text-zinc-300 hover:text-red-400 transition-colors"
                             style={{ fontSize: 16, lineHeight: 1 }}
                             onClick={(e) => { e.stopPropagation(); setCloseConfirm(project.id); }}
                             title="Close project"
@@ -5192,8 +5591,9 @@ useEffect(() => {
             onUpdateRecurring={(rid, patch) => setRecurring((prev) => prev.map((r) => (r.id === rid ? { ...r, ...patch } : r)))}
             recurringModal={recurringModal}
             setRecurringModal={setRecurringModal}
-            calendarDaysLen={calendarDaysLen}
+            calendarDaysLen={calDaysLen}
             setCalendarDaysLen={setCalendarDaysLen}
+            maxDays={maxCalDays}
             sensors={sensors}
             resizeEvt={resizeEvt}
             setResizeEvt={setResizeEvt}
@@ -5300,23 +5700,23 @@ useEffect(() => {
           const proj = projects.find((p) => p.id === rule.projectId);
           return (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setEditRecurringId(null)}>
-            <div className="w-full max-w-sm rounded-2xl border shadow-xl p-4" style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }} onClick={(e) => e.stopPropagation()}>
+            <div className="w-full max-w-sm rounded-2xl border shadow-xl p-4" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }} onClick={(e) => e.stopPropagation()}>
               <div className="flex items-center justify-between mb-3">
-                <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Edit recurrence</div>
-                <button className="h-8 w-8 rounded-full border text-lg" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }} onClick={() => setEditRecurringId(null)}>✕</button>
+                <div className="text-sm font-semibold" style={{ color: 'var(--pp-text)' }}>Edit recurrence</div>
+                <button className="h-8 w-8 rounded-full border text-lg" style={{ borderColor: 'var(--pp-border-strong)' }} onClick={() => setEditRecurringId(null)}>✕</button>
               </div>
               <div className="space-y-3">
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Task</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Task</div>
                   <div className="flex items-center gap-2">
                     <div className="h-3 w-3 rounded-full" style={{ background: proj?.color ?? '#64748b' }} />
-                    <input className="h-9 flex-1 rounded-lg border px-3 text-sm outline-none" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    <input className="h-9 flex-1 rounded-lg border px-3 text-sm outline-none" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                       value={editRecForm.title} onChange={(e) => setEditRecForm((p) => ({ ...p, title: e.target.value }))} />
                   </div>
                 </div>
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Repeat</div>
-                  <select className="h-9 w-full rounded-lg border px-2 text-sm" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Repeat</div>
+                  <select className="h-9 w-full rounded-lg border px-2 text-sm" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     value={editRecForm.recurrenceType} onChange={(e) => setEditRecForm((p) => ({ ...p, recurrenceType: e.target.value as any }))}>
                     <option value="weekly">Every week</option>
                     <option value="biweekly">Every 2 weeks</option>
@@ -5335,22 +5735,22 @@ useEffect(() => {
                 )}
                 {editRecForm.recurrenceType === "everyN" && (
                   <div className="flex items-center gap-2">
-                    <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Every</span>
-                    <input type="number" min="1" max="365" className="h-8 w-16 rounded-lg border px-2 text-xs" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    <span className="text-xs" style={{ color: 'var(--pp-text-muted)' }}>Every</span>
+                    <input type="number" min="1" max="365" className="h-8 w-16 rounded-lg border px-2 text-xs" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                       value={editRecForm.everyNDays} onChange={(e) => setEditRecForm((p) => ({ ...p, everyNDays: Math.max(1, parseInt(e.target.value) || 1) }))} />
-                    <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>days</span>
+                    <span className="text-xs" style={{ color: 'var(--pp-text-muted)' }}>days</span>
                   </div>
                 )}
                 {editRecForm.recurrenceType === "monthlyDate" && (
                   <div className="flex items-center gap-2">
-                    <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Day of month:</span>
-                    <input type="number" min="1" max="31" className="h-8 w-16 rounded-lg border px-2 text-xs" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    <span className="text-xs" style={{ color: 'var(--pp-text-muted)' }}>Day of month:</span>
+                    <input type="number" min="1" max="31" className="h-8 w-16 rounded-lg border px-2 text-xs" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                       value={editRecForm.monthDay} onChange={(e) => setEditRecForm((p) => ({ ...p, monthDay: Math.max(1, Math.min(31, parseInt(e.target.value) || 1)) }))} />
                   </div>
                 )}
               </div>
               <div className="mt-4 flex items-center justify-between">
-                <button className="h-8 rounded-lg border px-3 text-xs text-red-500 hover:bg-red-50" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', background: darkMode ? '#3a3a3c' : 'white' }}
+                <button className="h-8 rounded-lg border px-3 text-xs text-red-500 hover:bg-red-50" style={{ borderColor: 'var(--pp-border-strong)', background: 'var(--pp-surface-raised)' }}
                   onClick={() => { setPlanRecurring((prev) => prev.filter((r) => r.id !== editRecurringId)); setEditRecurringId(null); }}>Delete rule</button>
                 <button className="h-8 rounded-lg bg-zinc-900 px-4 text-xs font-semibold text-white hover:bg-zinc-800"
                   onClick={() => {
@@ -5369,20 +5769,39 @@ useEffect(() => {
           );
         })()}
 
+        {/* ---- MORNING E-MAIL PREVIEW ---- */}
+        {emailPreviewDay && emailPreview && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4" onClick={() => setEmailPreviewDay(null)}>
+            <div className="flex h-[90vh] w-full max-w-[640px] flex-col overflow-hidden rounded-2xl border shadow-xl" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center gap-2 border-b px-4 py-2" style={{ borderColor: 'var(--pp-border)' }}>
+                <div className="text-sm font-semibold" style={{ color: 'var(--pp-text)' }}>Morning e-mail preview</div>
+                <div className="ml-auto flex items-center gap-1">
+                  <button className="rounded-lg border px-2 py-1 text-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setEmailPreviewDay((d) => d && addDays(d, -1))}>◀︎</button>
+                  <button className="rounded-lg border px-2 py-1 text-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setEmailPreviewDay(todayUTC())}>Today</button>
+                  <button className="rounded-lg border px-2 py-1 text-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setEmailPreviewDay((d) => d && addDays(d, 1))}>▶︎</button>
+                  <button className="ml-1 h-8 w-8 rounded-full border text-base dm-btn" style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }} onClick={() => setEmailPreviewDay(null)}>✕</button>
+                </div>
+              </div>
+              <div className="truncate px-4 py-2 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Subject: <span style={{ color: 'var(--pp-text)' }}>{emailPreview.subject}</span></div>
+              <iframe title="E-mail preview" srcDoc={emailPreview.html} sandbox="" className="w-full flex-1 border-0 bg-white" />
+            </div>
+          </div>
+        )}
+
         {/* ---- ADD TASK MODAL ---- */}
         {addTaskModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20" onClick={() => setAddTaskModal(false)} style={{ padding: isMobile ? 0 : 16 }}>
-            <div className={isMobile ? "w-full h-full overflow-auto" : "w-full max-w-md max-h-[90vh] overflow-auto rounded-2xl border shadow-xl"} style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', padding: 16 }} onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center justify-between mb-3 sticky top-0 z-10 pb-2 -mx-4 px-4 pt-2" style={{ background: darkMode ? '#2c2c2e' : 'white' }}>
-                <div className="text-sm font-semibold" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>Add task</div>
-                <button className="h-9 w-9 rounded-full border text-lg hover:bg-zinc-50 dm-btn" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }} onClick={() => setAddTaskModal(false)}>✕</button>
+            <div className={isMobile ? "w-full h-full overflow-auto" : "w-full max-w-md max-h-[90vh] overflow-auto rounded-2xl border shadow-xl"} style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', padding: 16 }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-3 sticky top-0 z-10 pb-2 -mx-4 px-4 pt-2" style={{ background: 'var(--pp-surface)' }}>
+                <div className="text-sm font-semibold" style={{ color: 'var(--pp-text)' }}>Add task</div>
+                <button className="h-9 w-9 rounded-full border text-lg hover:bg-zinc-50 dm-btn" style={{ borderColor: 'var(--pp-border-strong)' }} onClick={() => setAddTaskModal(false)}>✕</button>
               </div>
               <div className="space-y-3">
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Project</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Project</div>
                   <select
                     className="h-9 w-full rounded-lg border px-2 text-sm dm-input"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     value={addTaskForm.projectId || projects[0]?.id || ""}
                     onChange={(e) => setAddTaskForm((p) => ({ ...p, projectId: e.target.value }))}
                   >
@@ -5390,59 +5809,59 @@ useEffect(() => {
                   </select>
                 </div>
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Task name</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Task name</div>
                   <input
                     autoFocus
                     className="h-9 w-full rounded-lg border px-3 text-sm outline-none focus:ring-2 focus:ring-blue-300 dm-input"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     placeholder="e.g. Write report, Team meeting…"
                     value={addTaskForm.title}
                     onChange={(e) => setAddTaskForm((p) => ({ ...p, title: e.target.value }))}
                   />
                 </div>
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Notes (optional)</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Notes (optional)</div>
                   <textarea
                     className="h-16 w-full resize-none rounded-lg border p-2 text-sm outline-none focus:ring-2 focus:ring-blue-300 dm-input"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     placeholder="Details, links, context…"
                     value={addTaskForm.notes}
                     onChange={(e) => setAddTaskForm((p) => ({ ...p, notes: e.target.value }))}
                   />
                 </div>
                 <div>
-                  <div className="mb-1 text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Date</div>
+                  <div className="mb-1 text-xs" style={{ color: 'var(--pp-text-muted)' }}>Date</div>
                   <input
                     type="date"
                     className="h-9 w-full rounded-lg border px-3 text-sm dm-input"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                     value={addTaskForm.day}
                     onChange={(e) => setAddTaskForm((p) => ({ ...p, day: e.target.value }))}
                   />
                 </div>
                 <div>
-                  <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: 'var(--pp-text-muted)' }}>
                     <input type="checkbox" checked={addTaskForm.timeEnabled} onChange={(e) => setAddTaskForm((p) => ({ ...p, timeEnabled: e.target.checked }))} />
                     Schedule time (show in calendar)
                   </label>
                   {addTaskForm.timeEnabled && (
                     <div className="flex gap-2 mt-1">
-                      <input type="time" className="h-8 flex-1 rounded-lg border px-2 text-sm dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      <input type="time" className="h-8 flex-1 rounded-lg border px-2 text-sm dm-input" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                         value={addTaskForm.startTime} onChange={(e) => setAddTaskForm((p) => ({ ...p, startTime: e.target.value }))} />
-                      <span className="text-xs self-center" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>to</span>
-                      <input type="time" className="h-8 flex-1 rounded-lg border px-2 text-sm dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      <span className="text-xs self-center" style={{ color: 'var(--pp-text-faint)' }}>to</span>
+                      <input type="time" className="h-8 flex-1 rounded-lg border px-2 text-sm dm-input" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                         value={addTaskForm.endTime} onChange={(e) => setAddTaskForm((p) => ({ ...p, endTime: e.target.value }))} />
                     </div>
                   )}
                 </div>
                 <div>
-                  <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: 'var(--pp-text-muted)' }}>
                     <input type="checkbox" checked={addTaskForm.recurring} onChange={(e) => setAddTaskForm((p) => ({ ...p, recurring: e.target.checked }))} />
                     Make recurring
                   </label>
                   {addTaskForm.recurring && (
                     <div className="mt-2 space-y-2">
-                      <select className="h-8 w-full rounded-lg border px-2 text-xs dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                      <select className="h-8 w-full rounded-lg border px-2 text-xs dm-input" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                         value={addTaskForm.recurrenceType} onChange={(e) => setAddTaskForm((p) => ({ ...p, recurrenceType: e.target.value as any }))}>
                         <option value="weekly">Every week</option>
                         <option value="biweekly">Every 2 weeks</option>
@@ -5461,16 +5880,16 @@ useEffect(() => {
                       )}
                       {addTaskForm.recurrenceType === "everyN" && (
                         <div className="flex items-center gap-2">
-                          <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Every</span>
-                          <input type="number" min="1" max="365" className="h-8 w-16 rounded-lg border px-2 text-xs dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                          <span className="text-xs" style={{ color: 'var(--pp-text-muted)' }}>Every</span>
+                          <input type="number" min="1" max="365" className="h-8 w-16 rounded-lg border px-2 text-xs dm-input" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                             value={addTaskForm.everyNDays} onChange={(e) => setAddTaskForm((p) => ({ ...p, everyNDays: Math.max(1, parseInt(e.target.value) || 1) }))} />
-                          <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>days</span>
+                          <span className="text-xs" style={{ color: 'var(--pp-text-muted)' }}>days</span>
                         </div>
                       )}
                       {addTaskForm.recurrenceType === "monthlyDate" && (
                         <div className="flex items-center gap-2">
-                          <span className="text-xs" style={{ color: darkMode ? '#a1a1a6' : '#71717a' }}>Day of month:</span>
-                          <input type="number" min="1" max="31" className="h-8 w-16 rounded-lg border px-2 text-xs dm-input" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                          <span className="text-xs" style={{ color: 'var(--pp-text-muted)' }}>Day of month:</span>
+                          <input type="number" min="1" max="31" className="h-8 w-16 rounded-lg border px-2 text-xs dm-input" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
                             value={addTaskForm.monthDay} onChange={(e) => setAddTaskForm((p) => ({ ...p, monthDay: Math.max(1, Math.min(31, parseInt(e.target.value) || 1)) }))} />
                         </div>
                       )}
@@ -5490,39 +5909,43 @@ useEffect(() => {
                     const laneId = proj.lanes[0]?.id;
                     if (!laneId) return;
 
-                    // Create the task in plan
-                    const createdId = `it_${crypto.randomUUID()}`;
-                    const catalogId = `t:${pid}:${createdId}`;
-                    const item: LaneItem = { 
-                      id: createdId, type: "task", title: addTaskForm.title.trim(), 
-                      start: addTaskForm.day, end: addTaskForm.day,
-                      ...(addTaskForm.notes.trim() ? { notes: addTaskForm.notes.trim() } : {}),
-                    };
-                    setProjects((prev) => {
-                      const next = structuredClone(prev) as Project[];
-                      const pIdx = next.findIndex((p) => p.id === pid);
-                      if (pIdx === -1) return prev;
-                      next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
-                      return next;
-                    });
+                    // A recurring task is only its rule – no extra one-off task on the chosen date
+                    if (!addTaskForm.recurring) {
+                      // Create the task in plan
+                      const createdId = `it_${crypto.randomUUID()}`;
+                      const catalogId = `t:${pid}:${createdId}`;
+                      const item: LaneItem = { 
+                        id: createdId, type: "task", title: addTaskForm.title.trim(), 
+                        start: addTaskForm.day, end: addTaskForm.day,
+                        ...(addTaskForm.notes.trim() ? { notes: addTaskForm.notes.trim() } : {}),
+                      };
+                      setProjects((prev) => {
+                        const next = structuredClone(prev) as Project[];
+                        const pIdx = next.findIndex((p) => p.id === pid);
+                        if (pIdx === -1) return prev;
+                        next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
+                        return next;
+                      });
 
-                    // Optionally schedule in calendar
-                    if (addTaskForm.timeEnabled) {
-                      const [sh, sm] = addTaskForm.startTime.split(":").map(Number);
-                      const [eh, em] = addTaskForm.endTime.split(":").map(Number);
-                      const startMin = sh * 60 + sm;
-                      const endMin = eh * 60 + em;
-                      setTimedEvents((prev) => ({
-                        ...prev,
-                        [catalogId]: { id: catalogId, day: addTaskForm.day, startMin, endMin: endMin > startMin ? endMin : startMin + 60 },
-                      }));
+                      // Optionally schedule in calendar
+                      if (addTaskForm.timeEnabled) {
+                        const [sh, sm] = addTaskForm.startTime.split(":").map(Number);
+                        const [eh, em] = addTaskForm.endTime.split(":").map(Number);
+                        const startMin = sh * 60 + sm;
+                        const endMin = eh * 60 + em;
+                        setTimedEvents((prev) => ({
+                          ...prev,
+                          [catalogId]: { id: catalogId, day: addTaskForm.day, startMin, endMin: endMin > startMin ? endMin : startMin + 60 },
+                        }));
+                      }
                     }
 
                     // Optionally add recurring
                     if (addTaskForm.recurring) {
                       const newRec: PlanRecurring = {
                         id: `pr_${crypto.randomUUID()}`, projectId: pid,
-                        title: addTaskForm.title.trim(),
+                        // Recurring tasks carry their time in the title ("10:00-11:00"), which the calendar reads
+                        title: addTaskForm.title.trim() + (addTaskForm.timeEnabled ? ` ${addTaskForm.startTime}-${addTaskForm.endTime}` : ""),
                         recurrenceType: addTaskForm.recurrenceType,
                         weekday: addTaskForm.recurringWeekday,
                         ...(addTaskForm.recurrenceType === "everyN" ? { everyNDays: addTaskForm.everyNDays, startDate: addTaskForm.day } : {}),
@@ -5540,13 +5963,13 @@ useEffect(() => {
                 </button>
               </div>
               {planRecurring.length > 0 && (
-                <div className="mt-3 border-t pt-3" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+                <div className="mt-3 border-t pt-3" style={{ borderColor: 'var(--pp-hover)' }}>
                   <button 
                     className="text-xs mb-1 flex items-center gap-1 cursor-pointer" 
-                    style={{ color: darkMode ? '#636366' : '#a1a1aa', background: 'none', border: 'none', padding: 0 }}
+                    style={{ color: 'var(--pp-text-faint)', background: 'none', border: 'none', padding: 0 }}
                     onClick={() => setShowRecurringList((v) => !v)}
                   >
-                    <span style={{ display: 'inline-block', transform: showRecurringList ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s', fontSize: 10 }}>▶</span>
+                    <span style={{ display: 'inline-block', transform: showRecurringList ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s', fontSize: 10 }}>▶︎</span>
                     Existing recurring tasks ({planRecurring.length})
                   </button>
                   {showRecurringList && (
@@ -5561,10 +5984,10 @@ useEffect(() => {
                     else if (rType === "monthlyDate") desc = `${r.monthDay ?? 1}th of month`;
                     else if (rType === "monthlyLast") desc = `last ${dayNames[r.weekday]}`;
                     return (
-                      <div key={r.id} className="flex items-center gap-2 rounded-lg border px-2 py-1.5" style={{ borderColor: darkMode ? '#3a3a3c' : '#f4f4f5' }}>
+                      <div key={r.id} className="flex items-center gap-2 rounded-lg border px-2 py-1.5" style={{ borderColor: 'var(--pp-hover)' }}>
                         <div className="h-2.5 w-2.5 rounded-full flex-shrink-0" style={{ background: proj?.color ?? "#64748b" }} />
-                        <div className="flex-1 text-xs" style={{ color: darkMode ? '#e5e5e7' : '#18181b' }}>{r.title}</div>
-                        <div className="text-[10px]" style={{ color: darkMode ? '#636366' : '#a1a1aa' }}>{desc}</div>
+                        <div className="flex-1 text-xs" style={{ color: 'var(--pp-text)' }}>{r.title}</div>
+                        <div className="text-[10px]" style={{ color: 'var(--pp-text-faint)' }}>{desc}</div>
                         <button className="text-zinc-300 hover:text-red-400 text-sm" onClick={() => setPlanRecurring((prev) => prev.filter((x) => x.id !== r.id))}>✕</button>
                       </div>
                     );
@@ -5582,38 +6005,38 @@ useEffect(() => {
         {inboxOpen && (
           <div
             className={isMobile ? "fixed inset-0 z-50 flex flex-col" : "fixed right-6 top-24 z-40 w-[340px] rounded-2xl border shadow-xl"}
-            style={{ background: darkMode ? '#2c2c2e' : 'white', borderColor: darkMode ? '#3a3a3c' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+            style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b px-3 py-2 flex-shrink-0" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+            <div className="flex items-center justify-between border-b px-3 py-2 flex-shrink-0" style={{ borderColor: 'var(--pp-border)' }}>
               <div className="text-sm font-semibold">Inbox</div>
               <button
                 className="h-9 w-9 rounded-full border text-lg"
-                style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}
                 onClick={() => setInboxOpen(false)}
                 title="Close"
               >✕</button>
             </div>
-            <div className="flex flex-wrap gap-1 border-b p-2 flex-shrink-0" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
-              <button className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === "all" ? (darkMode ? "bg-zinc-100 text-zinc-900" : "bg-zinc-900 text-white") : "")} style={inboxFilter !== "all" ? { background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#3f3f46', border: '1px solid' } : {}} onClick={() => setInboxFilter("all")}>All</button>
+            <div className="flex flex-wrap gap-1 border-b p-2 flex-shrink-0" style={{ borderColor: 'var(--pp-border)' }}>
+              <button className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === "all" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : "")} style={inboxFilter !== "all" ? { background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text-label)', border: '1px solid' } : {}} onClick={() => setInboxFilter("all")}>All</button>
               {projects.map((pp) => (
-                <button key={pp.id} className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === pp.id ? (darkMode ? "bg-zinc-100 text-zinc-900" : "bg-zinc-900 text-white") : "")} style={inboxFilter !== pp.id ? { background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#3f3f46', border: '1px solid' } : {}} onClick={() => setInboxFilter(pp.id)}>
+                <button key={pp.id} className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === pp.id ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : "")} style={inboxFilter !== pp.id ? { background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text-label)', border: '1px solid' } : {}} onClick={() => setInboxFilter(pp.id)}>
                   {pp.name.length > 10 ? pp.name.slice(0, 10) + "…" : pp.name}
                 </button>
               ))}
-              <button className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === "completed" ? (darkMode ? "bg-zinc-100 text-zinc-900" : "bg-zinc-900 text-white") : "")} style={inboxFilter !== "completed" ? { background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#a1a1a6' : '#3f3f46', border: '1px solid' } : {}} onClick={() => setInboxFilter("completed")}>Completed</button>
+              <button className={"rounded-lg px-2 py-1 text-xs " + (inboxFilter === "completed" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : "")} style={inboxFilter !== "completed" ? { background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text-label)', border: '1px solid' } : {}} onClick={() => setInboxFilter("completed")}>Completed</button>
             </div>
             <div className="flex-1 overflow-auto">
             {inboxFilter !== "completed" && (
-              <div className="border-b p-2" style={{ borderColor: darkMode ? '#3a3a3c' : '#e4e4e7' }}>
+              <div className="border-b p-2" style={{ borderColor: 'var(--pp-border)' }}>
                 <div className="flex gap-2">
-                  <select className="h-9 w-[120px] rounded-lg border px-2 text-sm" style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} value={inboxFilter === "all" ? projects[0]?.id ?? "" : inboxFilter} onChange={(e) => setInboxFilter(e.target.value)}>
+                  <select className="h-9 w-[120px] rounded-lg border px-2 text-sm" style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }} value={inboxFilter === "all" ? projects[0]?.id ?? "" : inboxFilter} onChange={(e) => setInboxFilter(e.target.value)}>
                     {projects.map((pp) => <option key={pp.id} value={pp.id}>{pp.name}</option>)}
                   </select>
                   <input
                     className="h-9 flex-1 rounded-lg border px-2 text-sm outline-none"
-                    style={{ background: darkMode ? '#1c1c1e' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}
+                    style={{ background: 'var(--pp-bg)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}
                     placeholder="new task…"
                     value={newInboxTitle}
                     onChange={(e) => setNewInboxTitle(e.target.value)}
@@ -5627,7 +6050,7 @@ useEffect(() => {
                       }
                     }}
                   />
-                  <button className="h-9 rounded-lg px-3 text-sm font-semibold text-white" style={{ background: darkMode ? '#636366' : '#18181b' }} onClick={() => {
+                  <button className="h-9 rounded-lg px-3 text-sm font-semibold text-white" style={{ background: 'var(--pp-text-dim)' }} onClick={() => {
                     const pid = inboxFilter === "all" ? projects[0]?.id : inboxFilter;
                     if (!pid || pid === "all" || pid === "completed") return;
                     addInboxTask(pid, newInboxTitle);
@@ -5639,10 +6062,10 @@ useEffect(() => {
             <div className="max-h-[70vh] overflow-auto p-2">
               {inboxFilter === "completed" ? (
                 <div className="space-y-2">
-                  {completed.length === 0 ? <div className="text-sm" style={{ color: darkMode ? '#8e8e93' : '#71717a' }}>Nothing in completed.</div> : completed.map((t) => (
-                    <div key={t.id} className="flex items-center justify-between rounded-lg border px-2 py-1 text-sm" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }}>
+                  {completed.length === 0 ? <div className="text-sm" style={{ color: 'var(--pp-icon)' }}>Nothing in completed.</div> : completed.map((t) => (
+                    <div key={t.id} className="flex items-center justify-between rounded-lg border px-2 py-1 text-sm" style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}>
                       <div className="truncate">{t.title}</div>
-                      <button className="ml-2 rounded-lg border px-2 py-1 text-xs" style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => returnFromCompleted(t.id)}>Restore</button>
+                      <button className="ml-2 rounded-lg border px-2 py-1 text-xs" style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }} onClick={() => returnFromCompleted(t.id)}>Restore</button>
                     </div>
                   ))}
                 </div>
@@ -5650,12 +6073,12 @@ useEffect(() => {
                 <div className="space-y-2">
                   {(() => {
                     const list = inboxFilter === "all" ? inbox : inbox.filter((x) => x.projectId === inboxFilter);
-                    if (list.length === 0) return <div className="text-sm" style={{ color: darkMode ? '#8e8e93' : '#71717a' }}>Inbox is empty.</div>;
+                    if (list.length === 0) return <div className="text-sm" style={{ color: 'var(--pp-icon)' }}>Inbox is empty.</div>;
                     return list.map((t) => {
                       const proj = projects.find((p) => p.id === t.projectId);
                       const color = proj?.color ?? "#64748b";
                       return (
-                        <div key={t.id} className="flex items-center gap-2 rounded-lg border px-2 py-1 min-w-0" style={{ borderColor: darkMode ? '#48484a' : '#e4e4e7' }}>
+                        <div key={t.id} className="flex items-center gap-2 rounded-lg border px-2 py-1 min-w-0" style={{ borderColor: 'var(--pp-border-strong)' }}>
                           <div className="min-w-0 flex-1">
                             <Draggable id={`inbox:${t.projectId}:${t.id}`}>
                               <div className="cursor-grab active:cursor-grabbing rounded-md px-2 py-1 text-sm font-semibold text-white" style={{ background: color }} title="Drag to grid">
@@ -5664,9 +6087,9 @@ useEffect(() => {
                             </Draggable>
                           </div>
                           <div className="flex flex-shrink-0 gap-1">
-                            <button className="h-8 w-8 rounded-lg border text-xs" style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => setDetailTarget({ kind: "inbox", inboxId: t.id })} title="Detail">⋯</button>
-                            <button className="h-8 w-8 rounded-lg border text-xs" style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => markInboxDone(t.id)} title="Done">✓</button>
-                            <button className="h-8 w-8 rounded-lg border text-xs" style={{ background: darkMode ? '#3a3a3c' : 'white', borderColor: darkMode ? '#48484a' : '#e4e4e7', color: darkMode ? '#e5e5e7' : '#18181b' }} onClick={() => removeInboxTask(t.id)} title="Delete">✕</button>
+                            <button className="h-8 w-8 rounded-lg border text-xs" style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }} onClick={() => setDetailTarget({ kind: "inbox", inboxId: t.id })} title="Detail">⋯</button>
+                            <button className="h-8 w-8 rounded-lg border text-xs" style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }} onClick={() => markInboxDone(t.id)} title="Done">✓</button>
+                            <button className="h-8 w-8 rounded-lg border text-xs" style={{ background: 'var(--pp-surface-raised)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }} onClick={() => removeInboxTask(t.id)} title="Delete">✕</button>
                           </div>
                         </div>
                       );

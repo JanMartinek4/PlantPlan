@@ -23,3 +23,9 @@ dist-ssr
 *.sln
 *.sw?
 .env
+# Daily agenda: the cron SQL holds the CRON_SECRET (functions/.env is covered by .env above)
+supabase/daily-agenda-cron.sql
+
+# Local backups made while editing
+zaloha pred */
+supabase/.temp/
