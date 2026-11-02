@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
   DndContext,
@@ -66,7 +66,11 @@ type PersistedStateV1 = {
   completed?: InboxTask[];
   collapsedProjects?: Record<string, boolean>;
   completedTasks?: Record<string, boolean>;
+  links?: PlanLink[];
 };
+
+// Arrow between two plan items (task or experiment, any project) – purely visual
+type PlanLink = { id: string; from: string; to: string }; // item ids
 
 const STORAGE_KEY = "pmorph_planner_v1";
 
@@ -376,6 +380,25 @@ function startAfterTouchHold(e: React.PointerEvent, start: () => void): boolean 
   return true;
 }
 
+// Drag sensors that never start on form controls, buttons or elements marked
+// data-no-dnd (resize handles, popovers) – those handle the pointer themselves
+const startsDrag = (target: EventTarget | null) =>
+  !(target instanceof Element && target.closest("input, textarea, select, button, [data-no-dnd]"));
+
+class PlannerMouseSensor extends MouseSensor {
+  static activators = [{
+    eventName: "onMouseDown" as const,
+    handler: ({ nativeEvent }: React.MouseEvent) => nativeEvent.button === 0 && startsDrag(nativeEvent.target),
+  }];
+}
+
+class PlannerTouchSensor extends TouchSensor {
+  static activators = [{
+    eventName: "onTouchStart" as const,
+    handler: ({ nativeEvent }: React.TouchEvent) => nativeEvent.touches.length <= 1 && startsDrag(nativeEvent.target),
+  }];
+}
+
 // Ref callback for popovers anchored at an item's left edge: shifts the popover
 // left when it would stick out past the scroll area (items near the right edge on phones)
 function keepPopoverInView(el: HTMLElement | null) {
@@ -516,6 +539,7 @@ function Segment({
   laneId,
   onSetDetailTarget,
   onMakeRecurring,
+  onStartLink,
 }: {
   item: LaneItem;
   color: string;
@@ -530,6 +554,7 @@ function Segment({
   laneId?: string;
   onSetDetailTarget?: (t: DetailTarget) => void;
   onMakeRecurring?: () => void;
+  onStartLink?: () => void;
 }) {
   const bg = item.type === "task" ? color : color + "22";
   const border = item.type === "task" ? "transparent" : color;
@@ -611,6 +636,7 @@ function Segment({
       {selected && item.type === "task" && (
         <div
           ref={keepPopoverInView}
+          data-no-dnd
           className="absolute left-0 top-full z-20 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
@@ -661,6 +687,13 @@ function Segment({
                 onClick={(e) => { e.stopPropagation(); commitTitle(); onMakeRecurring(); onClose?.(); }}
                 title="Make this task recurring"
               >↻</button>
+            )}
+            {onStartLink && (
+              <button
+                className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+                onClick={(e) => { e.stopPropagation(); commitTitle(); onStartLink(); }}
+                title="Draw an arrow to another task or experiment"
+              >→</button>
             )}
             <div className="flex gap-2">
             <button
@@ -753,6 +786,7 @@ function SubTaskPill({
       {selected && (
         <div
           ref={keepPopoverInView}
+          data-no-dnd
           className="absolute left-0 top-full z-30 mt-2 w-[260px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
@@ -887,10 +921,12 @@ function ExperimentPopover({
   onUpdateDesc,
   onDelete,
   onClose,
+  onStartLink,
 }: {
   item: LaneItem;
   left: number;
   top: number;
+  onStartLink?: () => void;
   projectId: string;
   laneId: string;
   onUpdateDesc: (desc: string) => void;
@@ -902,6 +938,7 @@ function ExperimentPopover({
   return (
     <div
       ref={keepPopoverInView}
+      data-no-dnd
       className="pointer-events-auto absolute z-[300] w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
       style={{ left, top }}
       onClick={(e) => e.stopPropagation()}
@@ -932,12 +969,154 @@ function ExperimentPopover({
           }}
           title="Open detail with notes"
         ><Icon name="note" size={12} /> Detail</button>
+        {onStartLink && (
+          <button
+            className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+            onClick={() => { onUpdateDesc(draftDesc); onStartLink(); }}
+            title="Draw an arrow to another task or experiment"
+          >→</button>
+        )}
         <div className="flex gap-2">
           <button className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50" onClick={onDelete}>Delete</button>
           <button className="h-8 rounded-lg bg-zinc-900 px-3 text-sm font-semibold text-white hover:bg-zinc-800" onClick={() => { onUpdateDesc(draftDesc); onClose(); }}>Save</button>
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------
+// LinkArrows — arrows between linked items, drawn over the plan grid.
+// Positions come from the rendered items ([data-item-id]); an item that is
+// outside the shown days or in a collapsed project is represented by a dot
+// at the edge of its project's header row.
+// ---------------------------------------------
+
+type ArrowShape = { id: string; d: string; color: string; end: [number, number]; endIsItem: boolean; start: [number, number]; startIsItem: boolean; mid: [number, number] };
+
+function LinkArrows({
+  links,
+  projects,
+  days,
+  selectedId,
+  onSelect,
+  onDelete,
+}: {
+  links: PlanLink[];
+  projects: Project[];
+  days: DayKey[];
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  onDelete: (id: string) => void;
+}) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [shape, setShape] = useState<{ w: number; h: number; arrows: ArrowShape[] }>({ w: 0, h: 0, arrows: [] });
+
+  const measure = () => {
+    const box = svgRef.current?.parentElement;
+    if (!box) return;
+    const br = box.getBoundingClientRect();
+    const w = box.scrollWidth;
+    const h = box.scrollHeight;
+    const colW = w / Math.max(1, days.length);
+
+    const anchor = (itemId: string, side: "out" | "in") => {
+      const el = box.querySelector(`[data-item-id="${CSS.escape(itemId)}"]`);
+      if (el) {
+        const r = el.getBoundingClientRect();
+        return { x: (side === "out" ? r.right : r.left) - br.left, y: r.top - br.top + r.height / 2, isItem: true };
+      }
+      for (const proj of projects) {
+        const item = proj.lanes.flatMap((l) => l.items).find((it) => it.id === itemId);
+        if (!item) continue;
+        const header = box.querySelector(`[data-project-id="${CSS.escape(proj.id)}"]`);
+        if (!header) return null;
+        const hr = header.getBoundingClientRect();
+        const day = side === "out" ? item.end : item.start;
+        const x = Math.max(6, Math.min(w - 6, (diffDays(days[0], day) + (side === "out" ? 1 : 0)) * colW));
+        return { x, y: hr.top - br.top + hr.height / 2, isItem: false };
+      }
+      return null;
+    };
+
+    const arrows: ArrowShape[] = [];
+    for (const l of links) {
+      const a = anchor(l.from, "out");
+      const b = anchor(l.to, "in");
+      if (!a || !b || (!a.isItem && !b.isItem)) continue; // nothing of it on screen
+      const color = projects.find((pr) => pr.lanes.some((ln) => ln.items.some((it) => it.id === l.from)))?.color ?? "#64748b";
+      const x2 = b.isItem ? b.x - 2 : b.x;
+      // forward: smooth S-curve; backward (target earlier): a small loop instead of a huge swing
+      const dx = x2 >= a.x ? Math.max(30, (x2 - a.x) / 2) : 50;
+      const c1: [number, number] = [a.x + dx, a.y];
+      const c2: [number, number] = [x2 - dx, b.y];
+      const mid: [number, number] = [
+        0.125 * a.x + 0.375 * c1[0] + 0.375 * c2[0] + 0.125 * x2,
+        0.125 * a.y + 0.375 * c1[1] + 0.375 * c2[1] + 0.125 * b.y,
+      ];
+      arrows.push({
+        id: l.id,
+        d: `M ${a.x} ${a.y} C ${c1[0]} ${c1[1]}, ${c2[0]} ${c2[1]}, ${x2} ${b.y}`,
+        color,
+        start: [a.x, a.y],
+        startIsItem: a.isItem,
+        end: [x2, b.y],
+        endIsItem: b.isItem,
+        mid,
+      });
+    }
+    const next = { w, h, arrows };
+    setShape((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+  };
+
+  // Re-measure after every render of the plan and when its size changes
+  useLayoutEffect(measure);
+  useEffect(() => {
+    const box = svgRef.current?.parentElement;
+    if (!box) return;
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(box);
+    return () => ro.disconnect();
+  });
+
+  const selected = shape.arrows.find((a) => a.id === selectedId);
+  return (
+    <>
+      <svg
+        ref={svgRef}
+        className="pointer-events-none absolute left-0 top-0"
+        style={{ width: shape.w, height: shape.h, zIndex: 15, overflow: "visible" }}
+      >
+        {shape.arrows.map((a) => (
+          <g key={a.id}>
+            <path d={a.d} fill="none" stroke={a.color} strokeWidth={a.id === selectedId ? 3 : 2} strokeOpacity={0.85} />
+            {/* wide invisible stroke = easy to hit */}
+            <path
+              d={a.d}
+              fill="none"
+              stroke="transparent"
+              strokeWidth={14}
+              style={{ pointerEvents: "stroke", cursor: "pointer" }}
+              onClick={(e) => { e.stopPropagation(); onSelect(a.id === selectedId ? null : a.id); }}
+            />
+            {a.endIsItem ? (
+              <polygon points={`${a.end[0]},${a.end[1]} ${a.end[0] - 8},${a.end[1] - 4.5} ${a.end[0] - 8},${a.end[1] + 4.5}`} fill={a.color} />
+            ) : (
+              <circle cx={a.end[0]} cy={a.end[1]} r={3.5} fill={a.color} />
+            )}
+            {!a.startIsItem && <circle cx={a.start[0]} cy={a.start[1]} r={3.5} fill={a.color} />}
+          </g>
+        ))}
+      </svg>
+      {selected && (
+        <button
+          className="absolute flex h-6 w-6 items-center justify-center rounded-full border text-xs shadow-sm"
+          style={{ left: selected.mid[0] - 12, top: selected.mid[1] - 12, zIndex: 16, background: 'var(--pp-surface)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-danger-strong)' }}
+          onClick={(e) => { e.stopPropagation(); onDelete(selected.id); }}
+          title="Delete arrow"
+        >✕</button>
+      )}
+    </>
   );
 }
 
@@ -969,6 +1148,7 @@ function LaneRow({
   onUpdateSubTaskTitle,
   onDeleteSubTask,
   onCopyExperiment,
+  onStartLink,
   planRecurringInstances = [],
   onOpenDetail,
 }: {
@@ -995,6 +1175,7 @@ function LaneRow({
   onUpdateSubTaskTitle: (experimentId: string, subTaskId: string, title: string) => void;
   onDeleteSubTask: (experimentId: string, subTaskId: string) => void;
   onCopyExperiment: (experimentId: string) => void;
+  onStartLink?: (itemId: string) => void;
   planRecurringInstances?: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string; recurringId?: string }>;
   onOpenDetail?: (target: DetailTarget) => void;
 }) {
@@ -1167,6 +1348,7 @@ function LaneRow({
                   <Draggable id={`item:${project.id}:${lane.id}:${it.id}`} className={it.type === "experiment" ? "h-full" : ""}>
                     <div
                       className="cursor-grab active:cursor-grabbing h-full"
+                      data-item-id={it.id} // arrow anchor
                       onDoubleClick={it.type === "experiment" ? (e) => {
                         // Double-click on an experiment day = add a sub-task there
                         e.stopPropagation();
@@ -1200,6 +1382,7 @@ function LaneRow({
                         projectId={project.id}
                         laneId={lane.id}
                         onSetDetailTarget={(t) => onOpenDetail?.(t!)}
+                        onStartLink={onStartLink && !it.id.startsWith("pr:") ? () => onStartLink(it.id) : undefined}
                         onMakeRecurring={it.type === "task" ? () => {
                           const isRecInstance = it.id.startsWith("pr:");
                           if (isRecInstance) {
@@ -1223,7 +1406,7 @@ function LaneRow({
                           <div
                             className="absolute left-0 top-0 z-20 h-full w-3 cursor-ew-resize"
                             title="Change experiment start"
-                            onTouchStart={(e) => e.stopPropagation()}
+                            data-no-dnd
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               if (e.button !== 0) return;
@@ -1237,7 +1420,7 @@ function LaneRow({
                           <div
                             className="absolute right-0 top-0 z-20 h-full w-3 cursor-ew-resize"
                             title="Change experiment end"
-                            onTouchStart={(e) => e.stopPropagation()}
+                            data-no-dnd
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               if (e.button !== 0) return;
@@ -1290,6 +1473,7 @@ function LaneRow({
                   onUpdateDesc={(desc) => onUpdateDesc(project.id, it.id, desc)}
                   onDelete={() => onDeleteItem(project.id, it.id)}
                   onClose={() => onClearSelection()}
+                  onStartLink={onStartLink && (() => onStartLink(it.id))}
                 />
               );
             })}
@@ -1366,6 +1550,7 @@ function LaneRow({
                     {expandedDay && expandedDay.expId === exp.id && expandedDay.day === day && (
                       <div
                         ref={keepPopoverInView}
+                        data-no-dnd
                         className="absolute left-0 top-full z-40 mt-2 w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-lg dm-popover"
                         onClick={(e) => e.stopPropagation()}
                         onPointerDown={(e) => e.stopPropagation()}
@@ -1500,8 +1685,8 @@ function AgendaView({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 8 } })
+    useSensor(PlannerMouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(PlannerTouchSensor, { activationConstraint: { delay: 300, tolerance: 8 } })
   );
 
   // Build per-day item list from all projects
@@ -1881,7 +2066,20 @@ function CalendarView({
   const [selectedEvtId, setSelectedEvtId] = useState<string | null>(null);
 
   // Quick-create: click on empty calendar slot to create a new task
-  const [quickCreate, setQuickCreate] = useState<{ day: DayKey; startMin: number; x: number; y: number } | null>(null);
+  const [quickCreate, setQuickCreate] = useState<{ day: DayKey; startMin: number; x: number; y: number; allDay?: boolean } | null>(null);
+
+  // Detail panel for a calendar task – plan task or experiment sub-task
+  const openTaskDetail = (t: TaskRef) => {
+    const m = t.meta as any;
+    const open = (window as any).__openDetail;
+    if (!m?.projectId || typeof open !== "function") return;
+    const proj = calProjects.find((p) => p.id === m.projectId);
+    const itemId = m.itemId ?? m.experimentId;
+    const lane = proj?.lanes.find((l) => l.items.some((it) => it.id === itemId));
+    if (!lane) return;
+    if (m.subTaskId) open({ kind: "subtask", projectId: m.projectId, laneId: lane.id, experimentId: m.experimentId, subTaskId: m.subTaskId, day: t.day });
+    else open({ kind: "item", projectId: m.projectId, laneId: lane.id, itemId: m.itemId });
+  };
   const [qcTitle, setQcTitle] = useState("");
   const [qcProjectId, setQcProjectId] = useState<string>("");
 
@@ -2029,7 +2227,7 @@ function CalendarView({
             <div
               className="absolute bottom-0 left-0 right-0 h-3 cursor-ns-resize"
               title="Change end time"
-              onTouchStart={(e) => e.stopPropagation()}
+              data-no-dnd
               onPointerDown={(e) => {
                 e.stopPropagation(); e.preventDefault();
                 if (e.button !== 0) return;
@@ -2058,6 +2256,7 @@ function CalendarView({
         {isSelected && !isRec && task && (
           <div
             ref={keepPopoverInView}
+            data-no-dnd
             className="absolute left-0 top-full z-[300] mt-1 w-[240px] rounded-xl border bg-white p-2 shadow-lg"
             style={{ borderColor: 'var(--pp-border)', background: 'var(--pp-surface)' }}
             onClick={(e) => e.stopPropagation()}
@@ -2069,18 +2268,7 @@ function CalendarView({
                 style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)', background: 'var(--pp-surface-raised)' }}
                 onClick={() => {
                   commitTitle();
-                  // Open detail panel via global function
-                  if (task.meta && typeof (window as any).__openDetail === "function") {
-                    const m = task.meta as any;
-                    if (m.projectId && m.itemId) {
-                      // find laneId
-                      const proj = calProjects.find((p: any) => p.id === m.projectId);
-                      const lane = proj?.lanes?.find((l: any) => l.items.some((it: any) => it.id === m.itemId));
-                      if (lane) {
-                        (window as any).__openDetail({ kind: "item", projectId: m.projectId, laneId: lane.id, itemId: m.itemId });
-                      }
-                    }
-                  }
+                  openTaskDetail(task);
                   setSelectedEvtId(null);
                 }}
                 title="Notes & checklist"
@@ -2363,7 +2551,18 @@ function CalendarView({
             <div className="flex" style={{ width: "100%" }}>
               <div className="flex-shrink-0 border px-1 py-1 text-[10px] leading-tight" style={{ width: TIME_COL, borderColor: 'var(--pp-border)', color: 'var(--pp-text-faint)' }}>all-day</div>
               {days.map((d) => (
-                <div key={d} className="border" style={{ width: dayW, flexShrink: 0, background: 'var(--pp-bg-subtle)', borderColor: 'var(--pp-border)' }}>
+                <div
+                  key={d}
+                  className="border cursor-pointer"
+                  style={{ width: dayW, flexShrink: 0, background: 'var(--pp-bg-subtle)', borderColor: 'var(--pp-border)' }}
+                  title="Click to add an all-day task"
+                  onClick={(e) => {
+                    if ((e.target as HTMLElement).closest("[data-allday-chip]")) return;
+                    setQcTitle("");
+                    setQcProjectId(calProjects[0]?.id ?? "");
+                    setQuickCreate({ day: d, startMin: 0, x: e.clientX, y: e.clientY, allDay: true });
+                  }}
+                >
                   <div className="px-2 py-1">
                     <div className="flex flex-wrap gap-1">
                       {(inboxByDay[d] ?? []).length === 0 ? (
@@ -2372,9 +2571,11 @@ function CalendarView({
                         (inboxByDay[d] ?? []).map((t) => (
                           <Draggable key={t.id} id={`inbox:${t.id}`}>
                             <div
+                              data-allday-chip
                               className="cursor-grab active:cursor-grabbing rounded-md px-2 py-0.5 text-[11px] font-semibold text-white shadow-sm"
                               style={{ background: t.color }}
                               title={t.title}
+                              onClick={() => openTaskDetail(t)}
                             >
                               <div className="truncate" style={{ maxWidth: Math.min(150, dayW - 32) }}>{t.title}</div>
                             </div>
@@ -2609,7 +2810,7 @@ function CalendarView({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="text-xs font-semibold mb-2" style={{ color: 'var(--pp-text-muted)' }}>
-              New task — {dayLabel(quickCreate.day).weekday} {dayLabel(quickCreate.day).md} · {String(Math.floor(quickCreate.startMin / 60)).padStart(2, "0")}:{String(quickCreate.startMin % 60).padStart(2, "0")}
+              New task — {dayLabel(quickCreate.day).weekday} {dayLabel(quickCreate.day).md} · {quickCreate.allDay ? "all-day" : `${String(Math.floor(quickCreate.startMin / 60)).padStart(2, "0")}:${String(quickCreate.startMin % 60).padStart(2, "0")}`}
             </div>
             <input
               autoFocus
@@ -2623,7 +2824,7 @@ function CalendarView({
                   e.preventDefault();
                   const pid = qcProjectId || calProjects[0]?.id;
                   if (pid) {
-                    onCreateNewTask(pid, qcTitle.trim(), quickCreate.day, quickCreate.startMin, quickCreate.startMin + 60);
+                    onCreateNewTask(pid, qcTitle.trim(), quickCreate.day, quickCreate.startMin, quickCreate.allDay ? quickCreate.startMin : quickCreate.startMin + 60);
                   }
                   setQuickCreate(null);
                 }
@@ -2648,7 +2849,7 @@ function CalendarView({
                   if (!qcTitle.trim()) return;
                   const pid = qcProjectId || calProjects[0]?.id;
                   if (pid) {
-                    onCreateNewTask(pid, qcTitle.trim(), quickCreate.day, quickCreate.startMin, quickCreate.startMin + 60);
+                    onCreateNewTask(pid, qcTitle.trim(), quickCreate.day, quickCreate.startMin, quickCreate.allDay ? quickCreate.startMin : quickCreate.startMin + 60);
                   }
                   setQuickCreate(null);
                 }}
@@ -3275,9 +3476,12 @@ const stored = readStored();
     return () => window.removeEventListener('resize', check);
   }, []);
 
-  const [windowStart, setWindowStart] = useState<DayKey>(() => stored?.windowStart ?? addDays(todayUTC(), -2));
+  // Every visit opens on today: 2nd column on a computer, 1st on a phone.
+  // Window lengths too start from the device default (not the last session).
+  const todayOffset = () => (isMobileViewport() ? 0 : -1);
+  const [windowStart, setWindowStart] = useState<DayKey>(() => addDays(todayUTC(), todayOffset()));
   const [viewMode, setViewMode] = useState<ViewMode>(() => stored?.viewMode ?? "plan");
-  const [calendarDaysLen, setCalendarDaysLen] = useState<1 | 2 | 3 | 5 | 7>(() => stored?.calendarDaysLen ?? 5);
+  const [calendarDaysLen, setCalendarDaysLen] = useState<1 | 2 | 3 | 5 | 7>(() => (isMobileViewport() ? 3 : 7));
   const [timedEvents, setTimedEvents] = useState<Record<string, TimedEvent>>(() => stored?.timedEvents ?? {});
   const [recurring, setRecurring] = useState<RecurringEvent[]>(() =>
     stored?.recurring ?? [
@@ -3286,10 +3490,28 @@ const stored = readStored();
     ]
   );
   const [planRecurring, setPlanRecurring] = useState<PlanRecurring[]>(() => (stored as any)?.planRecurring ?? []);
+  const [links, setLinks] = useState<PlanLink[]>(() => stored?.links ?? []);
+  // Arrow being drawn: the item it starts from; the next clicked item becomes its end
+  const [linkFrom, setLinkFrom] = useState<string | null>(null);
+  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(null);
+
+  function finishLink(toItemId: string) {
+    const from = linkFrom;
+    setLinkFrom(null);
+    if (!from || from === toItemId) return;
+    setLinks((prev) => (prev.some((l) => l.from === from && l.to === toItemId) ? prev : [...prev, { id: `ln_${crypto.randomUUID()}`, from, to: toItemId }]));
+  }
+
+  useEffect(() => {
+    if (!linkFrom) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setLinkFrom(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [linkFrom]);
   const [recurringModal, setRecurringModal] = useState(false);
   const [resizeEvt, setResizeEvt] = useState<{ id: string; pointerId: number } | null>(null);
 
-  const [windowLen, setWindowLen] = useState<5 | 7 | 14 | 28>(() => stored?.windowLen ?? 14);
+  const [windowLen, setWindowLen] = useState<5 | 7 | 14 | 28>(() => (isMobileViewport() ? 5 : 14));
   const [projects, setProjects] = useState<Project[]>(() =>
     stored?.projects ? normalizeProjects(stored.projects) : normalizeProjects(seed(stored?.windowStart ?? windowStart))
   );
@@ -3421,6 +3643,7 @@ useEffect(() => {
     collapsedProjects,
     ...(archivedProjects.length ? { archivedProjects } : {}),
     ...(planRecurring.length ? { planRecurring } : {}),
+    ...(links.length ? { links } : {}),
   } as any);
 
   // ---- Undo / Redo (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) ----
@@ -3432,10 +3655,8 @@ useEffect(() => {
 
   const restoreSnapshot = (s: PersistedStateV1) => {
     isRestoringRef.current = true;
-    setWindowStart(s.windowStart);
-    setWindowLen(s.windowLen);
+    // Days shown stay as they are on this device (another device may have saved its own)
     setViewMode(s.viewMode);
-    setCalendarDaysLen(s.calendarDaysLen);
     setProjects(normalizeProjects(s.projects));
     setTimedEvents(s.timedEvents);
     setRecurring(s.recurring);
@@ -3445,6 +3666,7 @@ useEffect(() => {
     setPlanRecurring((s as any).planRecurring ?? []);
     setArchivedProjects((s as any).archivedProjects ?? []);
     setCompletedTasks((s as any).completedTasks ?? {});
+    setLinks(s.links ?? []);
     setSelection(null);
     setDragCreate(null);
     setResizeExp(null);
@@ -3653,7 +3875,8 @@ useEffect(() => {
           JSON.stringify(prev.recurring) !== JSON.stringify(current.recurring) ||
           JSON.stringify((prev as any).planRecurring) !== JSON.stringify((current as any).planRecurring) ||
           JSON.stringify((prev as any).archivedProjects) !== JSON.stringify((current as any).archivedProjects) ||
-          JSON.stringify((prev as any).completedTasks) !== JSON.stringify((current as any).completedTasks);
+          JSON.stringify((prev as any).completedTasks) !== JSON.stringify((current as any).completedTasks) ||
+          JSON.stringify(prev.links) !== JSON.stringify(current.links);
         if (dataChanged) {
           undoStackRef.current.push(prev);
           if (undoStackRef.current.length > MAX_UNDO) undoStackRef.current.shift();
@@ -3668,7 +3891,7 @@ useEffect(() => {
       void pushCloud(current);
 }, 500);
     return () => window.clearTimeout(t);
-  }, [windowStart, windowLen, viewMode, calendarDaysLen, projects, timedEvents, recurring, planRecurring, inbox, completed, collapsedProjects, archivedProjects, completedTasks]);
+  }, [windowStart, windowLen, viewMode, calendarDaysLen, projects, timedEvents, recurring, planRecurring, inbox, completed, collapsedProjects, archivedProjects, completedTasks, links]);
 
   useEffect(() => {
     localStorage.setItem("pmorph_darkmode", String(darkMode));
@@ -4005,8 +4228,8 @@ useEffect(() => {
   }, [timedEvents, calDays, isLiveEvent]);
 
   const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 8 } })
+    useSensor(PlannerMouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(PlannerTouchSensor, { activationConstraint: { delay: 300, tolerance: 8 } })
   );
 
   const collisionDetection = (args: any) => {
@@ -4021,15 +4244,12 @@ useEffect(() => {
 
     // Inbox -> grid
     if (activeId.startsWith("inbox:")) {
-      const parts = activeId.split(":");
-      const fromProjectId = parts[1];
-      const inboxId = parts[2];
+      const inboxId = activeId.split(":")[2];
       const t = inbox.find((x) => x.id === inboxId);
       if (!t) return;
 
       if (overId.startsWith("cell:")) {
         const [, pId, laneId, day] = overId.split(":");
-        if (pId !== fromProjectId) return;
         addStandaloneTaskWithTitle(pId, laneId, day as DayKey, t.title, { notes: t.notes, checklist: t.checklist });
         setInbox((prev) => prev.filter((x) => x.id !== inboxId));
         return;
@@ -4037,7 +4257,6 @@ useEffect(() => {
 
       if (overId.startsWith("expday:")) {
         const [, pId, laneId, expId, day] = overId.split(":");
-        if (pId !== fromProjectId) return;
         addExperimentSubTaskWithTitle(pId, laneId, expId, day as DayKey, t.title, { notes: t.notes, checklist: t.checklist });
         setInbox((prev) => prev.filter((x) => x.id !== inboxId));
         return;
@@ -4048,14 +4267,14 @@ useEffect(() => {
     if (isPrefix(activeId, "item") && isPrefix(overId, "expday")) {
       const [, pId, _fromLaneId, itemId] = splitId(activeId);
       const [, p2Id, targetLaneId, expId, targetDay] = splitId(overId);
-      if (pId !== p2Id) return;
 
       const createdSubId = `st_${crypto.randomUUID()}`;
 
       setProjects((prev) => {
         const next = structuredClone(prev) as Project[];
         const pIdx = next.findIndex((p) => p.id === pId);
-        if (pIdx === -1) return prev;
+        const p2Idx = next.findIndex((p) => p.id === p2Id);
+        if (pIdx === -1 || p2Idx === -1) return prev;
         const project = next[pIdx];
 
         let taskTitle: string | null = null;
@@ -4078,7 +4297,11 @@ useEffect(() => {
 
         if (!removed || !taskTitle) return prev;
 
-        const lane2 = newLanes.find((l) => l.id === targetLaneId);
+        // Target lanes: the same project without the task, or the other project as is
+        const sameProject = pIdx === p2Idx;
+        if (!sameProject) next[pIdx] = { ...project, lanes: ensureAtLeastOneLane(newLanes) };
+        const targetLanes = sameProject ? newLanes : next[p2Idx].lanes;
+        const lane2 = targetLanes.find((l) => l.id === targetLaneId);
         if (!lane2) return prev;
         const exp = lane2.items.find((it) => it.id === expId);
         if (!exp || exp.type !== "experiment") return prev;
@@ -4090,14 +4313,14 @@ useEffect(() => {
         const updatedExp: LaneItem = { ...exp, subTasks: { ...exp.subTasks, [targetDay]: bucket } };
         const lane2Updated: Lane = { ...lane2, items: lane2.items.map((it) => (it.id === expId ? updatedExp : it)) };
 
-        next[pIdx] = {
-          ...project,
-          lanes: ensureAtLeastOneLane(newLanes.map((l) => (l.id === targetLaneId ? lane2Updated : l))),
+        next[p2Idx] = {
+          ...next[p2Idx],
+          lanes: ensureAtLeastOneLane(targetLanes.map((l) => (l.id === targetLaneId ? lane2Updated : l))),
         };
         return next;
       });
 
-      setSelection({ kind: "subtask", projectId: pId, experimentId: expId, subTaskId: createdSubId });
+      setSelection({ kind: "subtask", projectId: p2Id, experimentId: expId, subTaskId: createdSubId });
       return;
     }
 
@@ -4105,12 +4328,12 @@ useEffect(() => {
     if (isPrefix(activeId, "item") && isPrefix(overId, "cell")) {
       const [, pId, _fromLaneId, itemId] = splitId(activeId);
       const [, p2Id, targetLaneId, targetDay] = splitId(overId);
-      if (pId !== p2Id) return;
 
       setProjects((prev) => {
         const next = structuredClone(prev) as Project[];
         const pIdx = next.findIndex((p) => p.id === pId);
-        if (pIdx === -1) return prev;
+        const p2Idx = next.findIndex((p) => p.id === p2Id);
+        if (pIdx === -1 || p2Idx === -1) return prev;
         const project = next[pIdx];
 
         let found: { laneId: string; item: LaneItem } | null = null;
@@ -4128,9 +4351,18 @@ useEffect(() => {
           moved = { ...found.item, start: addDays(found.item.start, delta), end: addDays(found.item.end, delta) };
         }
 
-        next[pIdx] = placeItemPacked(project, targetLaneId, moved, found.item.id);
+        if (pIdx === p2Idx) {
+          next[pIdx] = placeItemPacked(project, targetLaneId, moved, found.item.id);
+        } else {
+          next[pIdx] = { ...project, lanes: ensureAtLeastOneLane(removeFromLanes(project.lanes, found.item.id)) };
+          next[p2Idx] = placeItemPacked(next[p2Idx], targetLaneId, moved);
+        }
         return next;
       });
+      if (pId !== p2Id) {
+        moveItemRefs(pId, p2Id, itemId);
+        setSelection(null);
+      }
       return;
     }
 
@@ -4174,6 +4406,21 @@ useEffect(() => {
       });
       return;
     }
+  }
+
+  // An item moved to another project keeps its calendar times and done-marks,
+  // which are keyed "t:<project>:<item>" / "st:<project>:<experiment>:<sub-task>"
+  function moveItemRefs(fromPid: string, toPid: string, itemId: string) {
+    const task = `t:${fromPid}:${itemId}`;
+    const subs = `st:${fromPid}:${itemId}:`;
+    const rename = (k: string) =>
+      k === task ? `t:${toPid}:${itemId}` : k.startsWith(subs) ? `st:${toPid}:${itemId}:${k.slice(subs.length)}` : k;
+    setTimedEvents((prev) => {
+      const out: Record<string, TimedEvent> = {};
+      for (const [k, ev] of Object.entries(prev)) out[rename(k)] = { ...ev, id: rename(ev.id) };
+      return out;
+    });
+    setCompletedTasks((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [rename(k), v])));
   }
 
   // Flag to prevent the outer container click from clearing selection
@@ -4563,6 +4810,8 @@ useEffect(() => {
     if (resizeExp) return;
     // With something selected (its popover open), a click on empty space only closes it
     if (selection) { setSelection(null); return; }
+    if (linkFrom) { setLinkFrom(null); return; }
+    if (selectedLinkId) { setSelectedLinkId(null); return; }
     setDragCreate({ projectId, laneId, startDay: day, currentDay: day, pointerId, moved: false });
   }
 
@@ -4678,6 +4927,7 @@ useEffect(() => {
       return n;
     });
     setSelection((s) => (s && s.kind === "item" && s.projectId === projectId && s.itemId === itemId ? null : s));
+    setLinks((prev) => (prev.some((l) => l.from === itemId || l.to === itemId) ? prev.filter((l) => l.from !== itemId && l.to !== itemId) : prev));
   }
 
   function updateExperimentRange(projectId: string, laneId: string, expId: string, patch: { start?: DayKey; end?: DayKey }) {
@@ -5099,7 +5349,7 @@ useEffect(() => {
               <div className="flex items-center gap-0.5">
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀︎◀︎</button>
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎</button>
-                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart(addDays(todayUTC(), todayOffset()))}>Today</button>
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶︎</button>
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶︎▶︎</button>
               </div>
@@ -5132,7 +5382,7 @@ useEffect(() => {
               <div className="flex items-center gap-0.5">
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>◀︎◀︎</button>
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎</button>
-                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-lg border px-2 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart(addDays(todayUTC(), todayOffset()))}>Today</button>
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶︎</button>
                 <button className="rounded-lg border px-1.5 py-1 text-xs shadow-sm dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>▶︎▶︎</button>
               </div>
@@ -5171,7 +5421,7 @@ useEffect(() => {
               <div className="flex items-center gap-0.5">
                 <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -windowLen))}>{`◀︎ -${windowLen}`}</button>
                 <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, -1))}>◀︎</button>
-                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => { const offset = (viewMode === "calendar" && calendarDaysLen <= 2) ? 0 : -2; setWindowStart(() => addDays(todayUTC(), offset)); }}>Today</button>
+                <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart(addDays(todayUTC(), todayOffset()))}>Today</button>
                 <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, 1))}>▶︎</button>
                 <button className="rounded-xl border px-3 py-2 text-sm shadow-sm dm-btn" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setWindowStart((d) => addDays(d, windowLen))}>{`+${windowLen} ▶︎`}</button>
               </div>
@@ -5251,7 +5501,7 @@ useEffect(() => {
               className="min-h-0 flex-1 overflow-auto rounded-2xl border shadow-sm"
               style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}
             >
-              <div>
+              <div className="relative">
 
                   {/* Sticky date header inside scroll container */}
                   <div
@@ -5351,6 +5601,7 @@ useEffect(() => {
                     <div key={project.id}>
                       {/* Project header */}
                       <div
+                        data-project-id={project.id}
                         className={`flex items-center ${isMobile ? 'gap-1 px-1 py-0.5' : 'gap-2 px-3 py-1'} border-b dm-project-header`}
                         style={{ borderColor: 'var(--pp-hover)' }}
                       >
@@ -5517,16 +5768,23 @@ useEffect(() => {
                           onUpdateResize={updateResize}
                           onFinishResize={finishResize}
                           selection={selection}
-                          onSelectItem={(projId, itemId) => setSelection({ kind: "item", projectId: projId, itemId })}
+                          onSelectItem={(projId, itemId) => {
+                            if (linkFrom) { if (!itemId.startsWith("pr:")) finishLink(itemId); return; }
+                            setSelection({ kind: "item", projectId: projId, itemId });
+                          }}
                           onDeleteItem={deleteItem}
                           onUpdateTitle={updateItemTitle}
                           onUpdateDesc={updateExperimentDesc}
                           onClearSelection={() => setSelection(null)}
                           onAddSubTask={(expId, day) => addExperimentSubTask(project.id, lane.id, expId, day)}
-                          onSelectSubTask={(expId, stId) => setSelection({ kind: "subtask", projectId: project.id, experimentId: expId, subTaskId: stId })}
+                          onSelectSubTask={(expId, stId) => {
+                            if (linkFrom) { finishLink(expId); return; } // a sub-task links its experiment
+                            setSelection({ kind: "subtask", projectId: project.id, experimentId: expId, subTaskId: stId });
+                          }}
                           onUpdateSubTaskTitle={(expId, stId, title) => updateExperimentSubTaskTitle(project.id, expId, stId, title)}
                           onDeleteSubTask={(expId, stId) => deleteExperimentSubTask(project.id, expId, stId)}
                           onCopyExperiment={(expId) => copyExperiment(project.id, expId)}
+                          onStartLink={(itemId) => { setSelection(null); setLinkFrom(itemId); }}
                           planRecurringInstances={planRecurringInstances}
                           onOpenDetail={(target) => setDetailTarget(target)}
                         />
@@ -5536,6 +5794,14 @@ useEffect(() => {
                     );
                   })}
 
+                  <LinkArrows
+                    links={links}
+                    projects={projects}
+                    days={days}
+                    selectedId={selectedLinkId}
+                    onSelect={setSelectedLinkId}
+                    onDelete={(id) => { setLinks((prev) => prev.filter((l) => l.id !== id)); setSelectedLinkId(null); }}
+                  />
               </div>
             </div>
           </div>
@@ -5616,7 +5882,8 @@ useEffect(() => {
                 next[pIdx] = placeItemPacked(next[pIdx], laneId, item);
                 return next;
               });
-              // 2) Create the timed event using the catalog-style composite ID
+              // 2) Create the timed event using the catalog-style composite ID (none for all-day)
+              if (endMin <= startMin) return;
               setTimedEvents((prev) => ({
                 ...prev,
                 [catalogId]: { id: catalogId, day, startMin, endMin },
@@ -5768,6 +6035,14 @@ useEffect(() => {
           </div>
           );
         })()}
+
+        {/* ---- DRAWING AN ARROW ---- */}
+        {linkFrom && (
+          <div className="fixed left-1/2 top-3 z-[60] flex -translate-x-1/2 items-center gap-3 rounded-xl border px-4 py-2 text-sm shadow-lg" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)' }}>
+            <span>Click the task or experiment the arrow should point to</span>
+            <button className="rounded-lg border px-2 py-1 text-xs dm-btn" style={{ borderColor: 'var(--pp-border)', color: 'var(--pp-text)' }} onClick={() => setLinkFrom(null)}>Cancel</button>
+          </div>
+        )}
 
         {/* ---- MORNING E-MAIL PREVIEW ---- */}
         {emailPreviewDay && emailPreview && (
