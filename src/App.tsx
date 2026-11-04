@@ -41,6 +41,7 @@ type TimedEvent = {
   day: DayKey;
   startMin: number;
   endMin: number;
+  remind?: boolean; // e-mail 10 minutes before startMin (sent by the daily-agenda function)
 };
 
 type RecurringEvent = {
@@ -323,7 +324,7 @@ function isPrefix(id: string, prefix: string) {
 // Icons (monochrome, follow currentColor)
 // ---------------------------------------------
 
-type IconName = "chevron-up" | "chevron-down" | "cascade" | "note";
+type IconName = "chevron-up" | "chevron-down" | "cascade" | "note" | "mail";
 
 const ICON_PATHS: Record<IconName, string> = {
   "chevron-up": "M4 10l4-4 4 4",
@@ -332,6 +333,8 @@ const ICON_PATHS: Record<IconName, string> = {
   cascade: "M2 4h6M5 8h7M8 12h6",
   // sheet with lines = notes / detail
   note: "M4 2.5h6l2.5 2.5v8.5h-8.5zM6 7h4.5M6 9.5h4.5M6 12h2.5",
+  // envelope = e-mail reminder
+  mail: "M2 4h12v8.5H2zM2 4.5l6 4.5 6-4.5",
 };
 
 // ---------------------------------------------
@@ -666,9 +669,9 @@ function Segment({
               }}
             />
           </div>
-          <div className="mt-2 flex items-center justify-between gap-2">
+          <div className="mt-2 flex items-center justify-between gap-1">
             <button
-              className="inline-flex h-8 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
+              className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
               onClick={(e) => { 
                 e.stopPropagation();
                 commitTitle(); 
@@ -683,27 +686,27 @@ function Segment({
             </button>
             {onMakeRecurring && (
               <button
-                className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+                className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
                 onClick={(e) => { e.stopPropagation(); commitTitle(); onMakeRecurring(); onClose?.(); }}
                 title="Make this task recurring"
               >↻</button>
             )}
             {onStartLink && (
               <button
-                className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+                className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
                 onClick={(e) => { e.stopPropagation(); commitTitle(); onStartLink(); }}
                 title="Draw an arrow to another task or experiment"
               >→</button>
             )}
-            <div className="flex gap-2">
+            <div className="flex gap-1">
             <button
-              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+              className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
               onClick={() => { commitTitle(); onClose?.(); }}
             >
               Save
             </button>
             <button
-              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+              className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
               onClick={() => { onDelete?.(); onClose?.(); }}
             >
               Delete
@@ -800,7 +803,7 @@ function SubTaskPill({
             <input
               ref={subTitleRef}
               data-title-editor="1"
-              className="h-8 w-full rounded-lg border border-zinc-200 px-2 text-sm outline-none focus:ring-2 focus:ring-zinc-300"
+              className="h-7 w-full rounded-lg border border-zinc-200 px-2 text-xs outline-none focus:ring-2 focus:ring-zinc-300"
               value={draft}
               placeholder="task name…"
               onChange={(e) => setDraft(e.target.value)}
@@ -821,9 +824,9 @@ function SubTaskPill({
               }}
             />
           </div>
-          <div className="mt-2 flex items-center justify-between gap-2">
+          <div className="mt-2 flex items-center justify-between gap-1">
             <button
-              className="inline-flex h-8 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
+              className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
               onClick={() => { commit(); onOpenDetail?.(); onClose?.(); }}
               title="Open detail with notes"
             >
@@ -831,20 +834,20 @@ function SubTaskPill({
             </button>
             {onStartLink && (
               <button
-                className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+                className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
                 onClick={() => { commit(); onStartLink(); }}
                 title="Draw an arrow to another task or experiment"
               >→</button>
             )}
-            <div className="flex gap-2">
+            <div className="flex gap-1">
             <button
-              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+              className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
               onClick={() => { commit(); onClose?.(); }}
             >
               Save
             </button>
             <button
-              className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50"
+              className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
               onClick={() => { onDelete?.(); onClose?.(); }}
             >
               Delete
@@ -969,9 +972,9 @@ function ExperimentPopover({
         }}
         onBlur={() => onUpdateDesc(draftDesc)}
       />
-      <div className="mt-2 flex items-center justify-between gap-2">
+      <div className="mt-2 flex items-center justify-between gap-1">
         <button
-          className="inline-flex h-8 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs hover:bg-zinc-50"
+          className="inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
           onClick={() => { 
             onUpdateDesc(draftDesc); 
             if (typeof (window as any).__openDetail === "function") {
@@ -983,14 +986,14 @@ function ExperimentPopover({
         ><Icon name="note" size={12} /> Detail</button>
         {onStartLink && (
           <button
-            className="h-8 rounded-lg border border-zinc-200 bg-white px-2 text-sm hover:bg-zinc-50"
+            className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50"
             onClick={() => { onUpdateDesc(draftDesc); onStartLink(); }}
             title="Draw an arrow to another task or experiment"
           >→</button>
         )}
-        <div className="flex gap-2">
-          <button className="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-sm hover:bg-zinc-50" onClick={onDelete}>Delete</button>
-          <button className="h-8 rounded-lg bg-zinc-900 px-3 text-sm font-semibold text-white hover:bg-zinc-800" onClick={() => { onUpdateDesc(draftDesc); onClose(); }}>Save</button>
+        <div className="flex gap-1">
+          <button className="h-7 rounded-lg border border-zinc-200 bg-white px-2 text-xs hover:bg-zinc-50" onClick={onDelete}>Delete</button>
+          <button className="h-7 rounded-lg bg-zinc-900 px-2 text-xs font-semibold text-white hover:bg-zinc-800" onClick={() => { onUpdateDesc(draftDesc); onClose(); }}>Save</button>
         </div>
       </div>
     </div>
@@ -2267,7 +2270,10 @@ function CalendarView({
               onBlur={() => commitTitle()}
             />
           ) : (
-            <div className="truncate pr-5">{title}</div>
+            <div className="truncate pr-5">
+              {ev.remind && <span className="mr-1 inline-block align-[-1px]" title="E-mail 10 min before"><Icon name="mail" size={11} /></span>}
+              {title}
+            </div>
           )}
 
           {!isSelected && !isRec && (
@@ -2312,7 +2318,7 @@ function CalendarView({
           <div
             ref={keepPopoverInView}
             data-no-dnd
-            className="absolute left-0 top-full z-[300] mt-1 w-[240px] rounded-xl border bg-white p-2 shadow-lg"
+            className="absolute left-0 top-full z-[300] mt-1 w-[296px] rounded-xl border bg-white p-2 shadow-lg"
             style={{ borderColor: 'var(--pp-border)', background: 'var(--pp-surface)' }}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => e.stopPropagation()}
@@ -2346,6 +2352,14 @@ function CalendarView({
                 title={task.meta && (task.meta as any).isPlanRecurring ? "Edit recurrence" : "Make recurring"}
               >↻</button>
               )}
+              <button
+                className="flex h-7 items-center rounded-lg border px-2 text-xs hover:bg-zinc-50"
+                style={ev.remind
+                  ? { borderColor: 'var(--pp-primary)', color: 'white', background: 'var(--pp-primary)' }
+                  : { borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)', background: 'var(--pp-surface-raised)' }}
+                onClick={() => onMoveEvent(ev.id, { remind: !ev.remind })}
+                title={ev.remind ? "E-mail reminder on (10 min before) – click to turn off" : "E-mail me 10 minutes before"}
+              ><Icon name="mail" size={13} /></button>
               <button
                 className="h-7 rounded-lg border px-2 text-xs hover:bg-zinc-50"
                 style={{ borderColor: 'var(--pp-border-strong)', color: 'var(--pp-text)', background: 'var(--pp-surface-raised)' }}

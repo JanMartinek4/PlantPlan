@@ -109,7 +109,7 @@ export type AgendaSource = {
       >;
     }>;
   }>;
-  timedEvents?: Record<string, { day: DayKey; startMin: number; endMin: number }>;
+  timedEvents?: Record<string, { day: DayKey; startMin: number; endMin: number; remind?: boolean }>;
   recurring?: Array<{ id: string; title: string; color: string; weekday: number; startMin: number; endMin: number }>;
   planRecurring?: PlanRecurring[];
   completedTasks?: Record<string, boolean>;
@@ -234,6 +234,8 @@ export function buildDailyAgenda(src: AgendaSource, day: DayKey): DailyAgenda {
 // E-mail rendering (inline styles only – e-mail clients ignore <style>)
 // ---------------------------------------------
 
+const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -263,7 +265,6 @@ export function renderAgendaEmail(a: DailyAgenda, opts: { locale?: string; appUr
   const running = a.sections.reduce((n, s) => n + s.experiments.length, 0);
   const subject = `PlantPlan · ${shortDate} · ${counts || (running ? `${plural(running, "experiment")} running` : "nothing planned")}`;
 
-  const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
   const MUTED = "#71717a";
   const dot = (color: string) => `<span style="display:inline-block;width:8px;height:8px;border-radius:4px;background:${esc(color)};margin-right:6px;vertical-align:middle"></span>`;
   const check = (done: boolean) => `<span style="display:inline-block;width:16px;color:${done ? "#16a34a" : "#a1a1aa"}">${done ? "&#10003;" : "&#9675;"}</span>`;
@@ -338,4 +339,46 @@ export function renderAgendaEmail(a: DailyAgenda, opts: { locale?: string; appUr
 </body></html>`;
 
   return { subject, html, text: text.join("\n") };
+}
+
+// ---------------------------------------------
+// Reminders: e-mail shortly before a scheduled task
+// ---------------------------------------------
+
+export const REMINDER_LEAD_MIN = 10;
+
+// Scheduled tasks with a reminder whose e-mail time (start − 10 min) falls in [fromMin, toMin)
+export function dueReminders(src: AgendaSource, day: DayKey, fromMin: number, toMin: number): DailyAgenda["schedule"] {
+  const timed = src.timedEvents ?? {};
+  return buildDailyAgenda(src, day).schedule.filter((e) => {
+    if (!timed[e.id]?.remind || e.done) return false;
+    const at = e.time.startMin - REMINDER_LEAD_MIN;
+    return at >= fromMin && at < toMin;
+  });
+}
+
+export function renderReminderEmail(entries: DailyAgenda["schedule"], opts: { appUrl?: string } = {}): { subject: string; html: string; text: string } {
+  const first = entries[0];
+  const more = entries.length > 1 ? ` +${entries.length - 1}` : "";
+  const subject = `⏰ ${hhmm(first.time.startMin)} ${first.title}${more}`;
+  const rows = entries
+    .map((e) => `<div style="margin:0 0 10px;padding:10px 14px;border:1px solid #e4e4e7;border-left:4px solid ${esc(e.color)};border-radius:8px">
+        <div style="font-size:13px;font-weight:600;color:#2563eb">${timeLabel(e.time)}</div>
+        <div style="font-size:16px;font-weight:600;color:#18181b">${esc(e.title)}</div>
+        ${e.projectName ? `<div style="font-size:13px;color:#71717a">${esc(e.projectName)}</div>` : ""}
+      </div>`)
+    .join("");
+  const footer = opts.appUrl ? `<a href="${esc(opts.appUrl)}" style="color:#2563eb;text-decoration:none">Open PlantPlan</a>` : "PlantPlan";
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(subject)}</title></head>
+<body style="margin:0;padding:0;background:#f4f4f5">
+  <div style="max-width:480px;margin:0 auto;padding:24px 16px;font-family:${FONT}">
+    <div style="padding:20px;background:#ffffff;border-radius:16px">
+      <p style="margin:0 0 12px;font-size:14px;color:#71717a">Starting in ${REMINDER_LEAD_MIN} minutes</p>
+      ${rows}
+      <p style="margin:16px 0 0;font-size:12px;color:#a1a1aa">${footer} · reminder</p>
+    </div>
+  </div>
+</body></html>`;
+  const text = [`Starting in ${REMINDER_LEAD_MIN} minutes`, "", ...entries.map((e) => `${timeLabel(e.time)}  ${e.title}${e.projectName ? ` (${e.projectName})` : ""}`)].join("\n");
+  return { subject, html, text };
 }
