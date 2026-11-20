@@ -25,7 +25,7 @@ import type { DragEndEvent } from "@dnd-kit/core";
 // ---------------------------------------------
 
 type ItemType = "task" | "experiment";
-type ViewMode = "plan" | "calendar" | "agenda";
+type ViewMode = "plan" | "compact" | "calendar" | "agenda";
 
 type TaskRef = {
   id: string;
@@ -72,6 +72,11 @@ type PersistedStateV1 = {
 
 // Arrow between two plan items (task or experiment, any project) – purely visual
 type PlanLink = { id: string; from: string; to: string }; // item ids
+
+// Compact view: id of the virtual project its rows belong to, and the prefix of its row ids
+const COMPACT_ID = "__compact";
+const COMPACT_ROW = "crow";
+const COMPACT_PROJECT: Project = { id: COMPACT_ID, name: "", color: "#64748b", lanes: [] };
 
 const STORAGE_KEY = "pmorph_planner_v1";
 
@@ -1016,7 +1021,9 @@ function LinkArrows({
   selectedId,
   onSelect,
   onDelete,
+  onlyFor,
 }: {
+  onlyFor?: Set<string> | null; // compact view: draw only arrows touching these items
   links: PlanLink[];
   projects: Project[];
   days: DayKey[];
@@ -1079,6 +1086,7 @@ function LinkArrows({
 
     const arrows: ArrowShape[] = [];
     for (const l of links) {
+      if (onlyFor && !onlyFor.has(l.from) && !onlyFor.has(l.to) && l.id !== selectedId) continue;
       const a = anchor(l.from, "out");
       const b = anchor(l.to, "in");
       if (!a || !b || (!a.isItem && !b.isItem)) continue; // nothing of it on screen
@@ -1139,6 +1147,7 @@ function LinkArrows({
     <>
       <svg
         ref={svgRef}
+        data-link-arrows
         className="pointer-events-none absolute left-0 top-0"
         style={{ width: 1, height: 1, zIndex: 15, overflow: "visible" }} // zero-size layer: draws over the plan without changing its size
       >
@@ -1206,6 +1215,7 @@ function LaneRow({
   onStartLink,
   planRecurringInstances = [],
   onOpenDetail,
+  sources,
 }: {
   project: Project;
   lane: Lane;
@@ -1216,7 +1226,7 @@ function LaneRow({
   onStartRange: (day: DayKey, pointerId: number) => void;
   onUpdateRange: (day: DayKey) => void;
   onFinishRange: (pointerId: number, clickedDay: DayKey, clickedExperimentId: string | null) => void;
-  onStartResize: (expId: string, edge: "start" | "end", pointerId: number) => void;
+  onStartResize: (projectId: string, laneId: string, expId: string, edge: "start" | "end", pointerId: number) => void;
   onUpdateResize: (day: DayKey) => void;
   onFinishResize: (pointerId: number) => void;
   selection: Selection;
@@ -1225,15 +1235,18 @@ function LaneRow({
   onUpdateTitle: (projectId: string, itemId: string, title: string) => void;
   onUpdateDesc: (projectId: string, itemId: string, desc: string) => void;
   onClearSelection: () => void;
-  onAddSubTask: (experimentId: string, day: DayKey) => void;
-  onSelectSubTask: (experimentId: string, subTaskId: string) => void;
-  onUpdateSubTaskTitle: (experimentId: string, subTaskId: string, title: string) => void;
-  onDeleteSubTask: (experimentId: string, subTaskId: string) => void;
-  onCopyExperiment: (experimentId: string) => void;
+  onAddSubTask: (projectId: string, laneId: string, experimentId: string, day: DayKey) => void;
+  onSelectSubTask: (projectId: string, experimentId: string, subTaskId: string) => void;
+  onUpdateSubTaskTitle: (projectId: string, experimentId: string, subTaskId: string, title: string) => void;
+  onDeleteSubTask: (projectId: string, experimentId: string, subTaskId: string) => void;
+  onCopyExperiment: (projectId: string, experimentId: string) => void;
   onStartLink?: (itemId: string) => void;
   planRecurringInstances?: Array<{ id: string; title: string; day: DayKey; projectId: string; color: string; recurringId?: string }>;
   onOpenDetail?: (target: DetailTarget) => void;
+  // Compact view: a row mixes items of several projects – where each item really lives
+  sources?: Record<string, { project: Project; laneId: string }>;
 }) {
+  const srcOf = (itemId: string) => sources?.[itemId] ?? { project, laneId: lane.id };
   const gridRef = useRef<HTMLDivElement | null>(null);
   const [expandedDay, setExpandedDay] = useState<{ expId: string; day: DayKey } | null>(null);
 
@@ -1264,7 +1277,7 @@ function LaneRow({
 
   useEffect(() => {
     if (!resizeExp) return;
-    if (resizeExp.projectId !== project.id || resizeExp.laneId !== lane.id) return;
+    if (!lane.items.some((it) => it.id === resizeExp.expId)) return;
 
     const pid = resizeExp.pointerId;
 
@@ -1290,7 +1303,7 @@ function LaneRow({
       window.removeEventListener("pointerup", stop, true);
       window.removeEventListener("pointercancel", stop, true);
     };
-  }, [resizeExp, project.id, lane.id, days]);
+  }, [resizeExp, lane, days]);
 
   return (
     <div className="flex">
@@ -1346,7 +1359,7 @@ function LaneRow({
                 }
                 try { (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId); } catch {}
 
-                if (resizeExp && resizeExp.projectId === project.id && resizeExp.laneId === lane.id && resizeExp.pointerId === e.pointerId) {
+                if (resizeExp && lane.items.some((it) => it.id === resizeExp.expId) && resizeExp.pointerId === e.pointerId) {
                   onFinishResize(e.pointerId);
                   return;
                 }
@@ -1396,11 +1409,12 @@ function LaneRow({
             const left = diffDays(days[0], visStart) * cellW + 4;
             const span = diffDays(visStart, visEnd) + 1;
             const width = span * cellW - 8;
+            const { project: ip, laneId: il } = srcOf(it.id);
 
             return (
               <div key={it.id} className="absolute" style={{ left, width, top: 4, height: frameH }}>
                 <div className="pointer-events-auto h-full">
-                  <Draggable id={`item:${project.id}:${lane.id}:${it.id}`} className={it.type === "experiment" ? "h-full" : ""}>
+                  <Draggable id={`item:${ip.id}:${il}:${it.id}`} className={it.type === "experiment" ? "h-full" : ""}>
                     <div
                       className="cursor-grab active:cursor-grabbing h-full"
                       data-item-id={it.id} // arrow anchor
@@ -1408,43 +1422,43 @@ function LaneRow({
                         // Double-click on an experiment day = add a sub-task there
                         e.stopPropagation();
                         const d = dayAtClientX(e.clientX);
-                        if (d && compareDay(d, it.start) >= 0 && compareDay(d, it.end) <= 0) onAddSubTask(it.id, d);
+                        if (d && compareDay(d, it.start) >= 0 && compareDay(d, it.end) <= 0) onAddSubTask(ip.id, il, it.id, d);
                       } : undefined}
                       onPointerDown={(e) => {
                         // Ctrl/Cmd + click on experiment = copy to new lane
                         if (it.type === "experiment" && (e.ctrlKey || e.metaKey)) {
                           e.stopPropagation();
                           e.preventDefault();
-                          onCopyExperiment(it.id);
+                          onCopyExperiment(ip.id, it.id);
                         }
                       }}
                     >
                       <Segment
                         item={it}
-                        color={project.color}
+                        color={ip.color}
                         selected={
                           !!selection &&
                           selection.kind === "item" &&
-                          selection.projectId === project.id &&
+                          selection.projectId === ip.id &&
                           selection.itemId === it.id
                         }
-                        onSelect={() => onSelectItem(project.id, it.id)}
-                        onDelete={() => onDeleteItem(project.id, it.id)}
-                        onUpdateTitle={(title) => onUpdateTitle(project.id, it.id, title)}
-                        onUpdateDesc={(desc) => onUpdateDesc(project.id, it.id, desc)}
+                        onSelect={() => onSelectItem(ip.id, it.id)}
+                        onDelete={() => onDeleteItem(ip.id, it.id)}
+                        onUpdateTitle={(title) => onUpdateTitle(ip.id, it.id, title)}
+                        onUpdateDesc={(desc) => onUpdateDesc(ip.id, it.id, desc)}
                         onClose={() => onClearSelection()}
-                        onOpenDetail={() => onOpenDetail?.({ kind: "item", projectId: project.id, laneId: lane.id, itemId: it.id })}
-                        projectId={project.id}
-                        laneId={lane.id}
+                        onOpenDetail={() => onOpenDetail?.({ kind: "item", projectId: ip.id, laneId: il, itemId: it.id })}
+                        projectId={ip.id}
+                        laneId={il}
                         onSetDetailTarget={(t) => onOpenDetail?.(t!)}
                         onStartLink={onStartLink && !it.id.startsWith("pr:") ? () => onStartLink(it.id) : undefined}
                         onMakeRecurring={it.type === "task" ? () => {
                           const isRecInstance = it.id.startsWith("pr:");
                           if (isRecInstance) {
                             const ruleId = it.id.split(":").slice(1, -1).join(":");
-                            window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: project.id, title: it.title, recurringId: ruleId } }));
+                            window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: ip.id, title: it.title, recurringId: ruleId } }));
                           } else {
-                            window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: project.id, title: it.title } }));
+                            window.dispatchEvent(new CustomEvent("make-recurring", { detail: { projectId: ip.id, title: it.title } }));
                           }
                         } : undefined}
                       />
@@ -1466,8 +1480,8 @@ function LaneRow({
                               e.stopPropagation();
                               if (e.button !== 0) return;
                               const pid = e.pointerId;
-                              if (startAfterTouchHold(e, () => onStartResize(it.id, "start", pid))) return;
-                              onStartResize(it.id, "start", pid);
+                              if (startAfterTouchHold(e, () => onStartResize(ip.id, il, it.id, "start", pid))) return;
+                              onStartResize(ip.id, il, it.id, "start", pid);
                             }}
                             onPointerUp={(e) => { e.stopPropagation(); onFinishResize(e.pointerId); }}
                             onPointerCancel={(e) => { e.stopPropagation(); onFinishResize(e.pointerId); }}
@@ -1483,7 +1497,7 @@ function LaneRow({
                               const pid = e.pointerId;
                               const begin = () => {
                                 try { handle.setPointerCapture(pid); } catch {}
-                                onStartResize(it.id, "end", pid);
+                                onStartResize(ip.id, il, it.id, "end", pid);
                               };
                               if (startAfterTouchHold(e, begin)) return;
                               begin();
@@ -1512,9 +1526,10 @@ function LaneRow({
           {itemsInWindow
             .filter((it) => it.type === "experiment" && 
               !!selection && selection.kind === "item" && 
-              selection.projectId === project.id && selection.itemId === it.id
+              selection.projectId === srcOf(it.id).project.id && selection.itemId === it.id
             )
             .map((it) => {
+              const { project: ip, laneId: il } = srcOf(it.id);
               const visStart = compareDay(it.start, days[0]) < 0 ? days[0] : it.start;
               const left = diffDays(days[0], visStart) * cellW + 4;
               return (
@@ -1523,10 +1538,10 @@ function LaneRow({
                   item={it}
                   left={left}
                   top={4 + frameH + 6} // below the frame, so its days and "+" stay clickable
-                  projectId={project.id}
-                  laneId={lane.id}
-                  onUpdateDesc={(desc) => onUpdateDesc(project.id, it.id, desc)}
-                  onDelete={() => onDeleteItem(project.id, it.id)}
+                  projectId={ip.id}
+                  laneId={il}
+                  onUpdateDesc={(desc) => onUpdateDesc(ip.id, it.id, desc)}
+                  onDelete={() => onDeleteItem(ip.id, it.id)}
                   onClose={() => onClearSelection()}
                   onStartLink={onStartLink && (() => onStartLink(it.id))}
                 />
@@ -1542,7 +1557,7 @@ function LaneRow({
               nodes.push(
                 <ExpDayDroppable
                   key={`expday:${exp.id}:${day}`}
-                  id={`expday:${project.id}:${lane.id}:${exp.id}:${day}`}
+                  id={`expday:${srcOf(exp.id).project.id}:${srcOf(exp.id).laneId}:${exp.id}:${day}`}
                   style={{ left: x, top: 4 + frameH - 20, width: cellW - 16, height: 20, pointerEvents: "none" }}
                 />
               );
@@ -1555,6 +1570,7 @@ function LaneRow({
             .filter((it) => it.type === "experiment")
             .flatMap((it) => {
               const exp = it as Extract<LaneItem, { type: "experiment" }>;
+              const { project: ip, laneId: il } = srcOf(exp.id);
               const out: React.ReactNode[] = [];
 
               for (const [day, tasks] of Object.entries(exp.subTasks)) {
@@ -1570,23 +1586,23 @@ function LaneRow({
                   <div key={`${exp.id}:${day}`} className="pointer-events-auto absolute" style={{ left: x, top: 8, width: cellW - 16 }}>
                     <div className="space-y-1">
                       {shown.map((t) => (
-                        <Draggable id={`subtask:${project.id}:${lane.id}:${exp.id}:${t.id}`} key={t.id}>
+                        <Draggable id={`subtask:${ip.id}:${il}:${exp.id}:${t.id}`} key={t.id}>
                           <div className="cursor-grab active:cursor-grabbing">
                             <SubTaskPill
                               text={t.title}
-                              color={project.color}
+                              color={ip.color}
                               onClose={() => onClearSelection()}
                               selected={
                                 !!selection &&
                                 selection.kind === "subtask" &&
-                                selection.projectId === project.id &&
+                                selection.projectId === ip.id &&
                                 selection.experimentId === exp.id &&
                                 selection.subTaskId === t.id
                               }
-                              onSelect={() => onSelectSubTask(exp.id, t.id)}
-                              onUpdateTitle={(title) => onUpdateSubTaskTitle(exp.id, t.id, title)}
-                              onDelete={() => onDeleteSubTask(exp.id, t.id)}
-                              onOpenDetail={() => onOpenDetail?.({ kind: "subtask", projectId: project.id, laneId: lane.id, experimentId: exp.id, subTaskId: t.id, day })}
+                              onSelect={() => onSelectSubTask(ip.id, exp.id, t.id)}
+                              onUpdateTitle={(title) => onUpdateSubTaskTitle(ip.id, exp.id, t.id, title)}
+                              onDelete={() => onDeleteSubTask(ip.id, exp.id, t.id)}
+                              onOpenDetail={() => onOpenDetail?.({ kind: "subtask", projectId: ip.id, laneId: il, experimentId: exp.id, subTaskId: t.id, day })}
                               anchorId={t.id}
                               onStartLink={onStartLink && (() => onStartLink(t.id))}
                             />
@@ -1627,19 +1643,19 @@ function LaneRow({
                             <div key={tt.id} className="rounded-lg border border-zinc-200 p-2">
                               <SubTaskPill
                                 text={tt.title}
-                                color={project.color}
+                                color={ip.color}
                                 selected={
                                   !!selection &&
                                   selection.kind === "subtask" &&
-                                  selection.projectId === project.id &&
+                                  selection.projectId === ip.id &&
                                   selection.experimentId === exp.id &&
                                   selection.subTaskId === tt.id
                                 }
-                                onSelect={() => onSelectSubTask(exp.id, tt.id)}
-                                onUpdateTitle={(title) => onUpdateSubTaskTitle(exp.id, tt.id, title)}
-                                onDelete={() => onDeleteSubTask(exp.id, tt.id)}
+                                onSelect={() => onSelectSubTask(ip.id, exp.id, tt.id)}
+                                onUpdateTitle={(title) => onUpdateSubTaskTitle(ip.id, exp.id, tt.id, title)}
+                                onDelete={() => onDeleteSubTask(ip.id, exp.id, tt.id)}
                                 onClose={() => onClearSelection()}
-                                onOpenDetail={() => onOpenDetail?.({ kind: "subtask", projectId: project.id, laneId: lane.id, experimentId: exp.id, subTaskId: tt.id, day })}
+                                onOpenDetail={() => onOpenDetail?.({ kind: "subtask", projectId: ip.id, laneId: il, experimentId: exp.id, subTaskId: tt.id, day })}
                                 onStartLink={onStartLink && (() => onStartLink(tt.id))}
                               />
                             </div>
@@ -1660,7 +1676,8 @@ function LaneRow({
 
           {/* "+" add sub-task: on the hovered day, or on every day of a selected experiment (touch) */}
           {experimentsInWindow.flatMap((exp) => {
-            const expSelected = !!selection && selection.kind === "item" && selection.projectId === project.id && selection.itemId === exp.id;
+            const { project: ip, laneId: il } = srcOf(exp.id);
+            const expSelected = !!selection && selection.kind === "item" && selection.projectId === ip.id && selection.itemId === exp.id;
             return days
               .filter((day) => compareDay(day, exp.start) >= 0 && compareDay(day, exp.end) <= 0)
               .filter((day) => expSelected || day === hoverDay)
@@ -1674,13 +1691,13 @@ function LaneRow({
                     width: 18,
                     height: 18,
                     background: "var(--pp-surface)",
-                    borderColor: project.color,
-                    color: project.color,
+                    borderColor: ip.color,
+                    color: ip.color,
                   }}
                   title="Add task to experiment (or double-click the day)"
                   onPointerDown={(e) => e.stopPropagation()}
                   onDoubleClick={(e) => e.stopPropagation()}
-                  onClick={(e) => { e.stopPropagation(); onAddSubTask(exp.id, day); }}
+                  onClick={(e) => { e.stopPropagation(); onAddSubTask(ip.id, il, exp.id, day); }}
                 >
                   +
                 </button>
@@ -3633,6 +3650,19 @@ const stored = readStored();
   const [dragCreate, setDragCreate] = useState<DragCreate>(null);
   const [resizeExp, setResizeExp] = useState<ResizeExp>(null);
 
+  // Compact view: row of each item, the item under the pointer (its arrows are shown),
+  // and a new task/experiment waiting for its project to be picked
+  const compactRowHintRef = useRef<Record<string, number>>({});
+  const [hoverItemId, setHoverItemId] = useState<string | null>(null);
+  const [projectPick, setProjectPick] = useState<
+    | { kind: "task"; day: DayKey; row: number }
+    | { kind: "experiment"; start: DayKey; end: DayKey; row: number }
+    | null
+  >(null);
+  const [lastProjectId, setLastProjectId] = useState<string | null>(() => {
+    try { return localStorage.getItem("pmorph_last_project"); } catch { return null; }
+  });
+
   // Listen for custom "open-detail" events dispatched from deeply nested components
   // Use a global function ref approach to bypass any event/compilation issues
   const openDetailRef = useRef((t: DetailTarget) => {});
@@ -3675,7 +3705,7 @@ useEffect(() => {
 
 
   useEffect(() => {
-    if (viewMode !== "plan") return;
+    if (viewMode !== "plan" && viewMode !== "compact") return;
     const el = planWrapRef.current;
     if (!el) return;
 
@@ -4318,7 +4348,18 @@ useEffect(() => {
       if (!t) return;
 
       if (overId.startsWith("cell:")) {
-        const [, pId, laneId, day] = overId.split(":");
+        let [, pId, laneId, day] = overId.split(":");
+        if (pId === COMPACT_ID) {
+          // Compact row: the task goes to its own project
+          const row = parseInt(laneId.slice(COMPACT_ROW.length), 10) || 0;
+          pId = projects.some((p) => p.id === t.projectId) ? t.projectId : (lastProjectId && projects.some((p) => p.id === lastProjectId) ? lastProjectId : projects[0]?.id ?? "");
+          if (!pId) return;
+          laneId = "";
+          const id = addStandaloneTaskWithTitle(pId, laneId, day as DayKey, t.title, { notes: t.notes, checklist: t.checklist });
+          compactRowHintRef.current[id] = row;
+          setInbox((prev) => prev.filter((x) => x.id !== inboxId));
+          return;
+        }
         addStandaloneTaskWithTitle(pId, laneId, day as DayKey, t.title, { notes: t.notes, checklist: t.checklist });
         setInbox((prev) => prev.filter((x) => x.id !== inboxId));
         return;
@@ -4396,8 +4437,14 @@ useEffect(() => {
 
     // Move whole segments
     if (isPrefix(activeId, "item") && isPrefix(overId, "cell")) {
-      const [, pId, _fromLaneId, itemId] = splitId(activeId);
-      const [, p2Id, targetLaneId, targetDay] = splitId(overId);
+      const [, pId, fromLaneId, itemId] = splitId(activeId);
+      let [, p2Id, targetLaneId, targetDay] = splitId(overId);
+      if (p2Id === COMPACT_ID) {
+        // Compact view: only the days change; the item tries the row it was dropped on
+        compactRowHintRef.current[itemId] = parseInt(targetLaneId.slice(COMPACT_ROW.length), 10) || 0;
+        p2Id = pId;
+        targetLaneId = fromLaneId;
+      }
 
       setProjects((prev) => {
         const next = structuredClone(prev) as Project[];
@@ -4516,7 +4563,7 @@ useEffect(() => {
   }
 
   function addStandaloneTask(projectId: string, laneId: string, day: DayKey) {
-    addStandaloneTaskWithTitle(projectId, laneId, day, "task");
+    return addStandaloneTaskWithTitle(projectId, laneId, day, "task");
   }
 
   function addStandaloneTaskWithTitle(projectId: string, laneId: string, day: DayKey, title: string, extra?: { notes?: string; checklist?: CheckItem[] }) {
@@ -4533,6 +4580,7 @@ useEffect(() => {
     setSelection({ kind: "item", projectId, itemId: createdId });
     // Schedule aggressive focus on the title editor that will appear
     scheduleEditorFocus();
+    return createdId;
   }
 
   function addExperimentSubTaskWithTitle(projectId: string, laneId: string, experimentId: string, day: DayKey, title: string, extra?: { notes?: string; checklist?: CheckItem[] }) {
@@ -4598,6 +4646,7 @@ useEffect(() => {
     // Open its popover so the new experiment can be named right away
     skipNextDeselectRef.current = true;
     setSelection({ kind: "item", projectId, itemId: item.id });
+    return item.id;
   }
 
   function addExperimentSubTask(projectId: string, laneId: string, experimentId: string, day: DayKey) {
@@ -4882,6 +4931,16 @@ useEffect(() => {
   }
 
 
+  function selectItem(projectId: string, itemId: string) {
+    if (linkFrom) { if (!itemId.startsWith("pr:")) finishLink(itemId); return; }
+    setSelection({ kind: "item", projectId, itemId });
+  }
+
+  function selectSubTask(projectId: string, experimentId: string, subTaskId: string) {
+    if (linkFrom) { finishLink(subTaskId); return; }
+    setSelection({ kind: "subtask", projectId, experimentId, subTaskId });
+  }
+
   function startRange(projectId: string, laneId: string, day: DayKey, pointerId: number) {
     if (resizeExp) return;
     // With something selected (its popover open), a click on empty space only closes it
@@ -4901,6 +4960,18 @@ useEffect(() => {
     setDragCreate((s) => {
       if (!s) return s;
       if (s.pointerId !== pointerId) return s;
+      if (s.projectId === COMPACT_ID) {
+        // Compact row: a click into an experiment adds its sub-task, otherwise ask for the project
+        const row = parseInt(s.laneId.slice(COMPACT_ROW.length), 10) || 0;
+        const src = clickedExperimentId ? compactRows.sources[clickedExperimentId] : null;
+        if (!s.moved || s.startDay === s.currentDay) {
+          if (src && clickedExperimentId) addExperimentSubTask(src.project.id, src.laneId, clickedExperimentId, clickedDay);
+          else askProject({ kind: "task", day: clickedDay, row });
+        } else {
+          askProject({ kind: "experiment", start: s.startDay, end: s.currentDay, row });
+        }
+        return null;
+      }
       if (!s.moved || s.startDay === s.currentDay) {
         if (clickedExperimentId) {
           addExperimentSubTask(s.projectId, s.laneId, clickedExperimentId, clickedDay);
@@ -4912,6 +4983,23 @@ useEffect(() => {
       }
       return null;
     });
+  }
+
+  // New item from the compact view: with a single project there is nothing to ask
+  function askProject(pick: NonNullable<typeof projectPick>) {
+    if (projects.length === 1) createPicked(pick, projects[0].id);
+    else if (projects.length > 1) setProjectPick(pick);
+  }
+
+  function createPicked(pick: NonNullable<typeof projectPick>, projectId: string) {
+    setProjectPick(null);
+    setLastProjectId(projectId);
+    try { localStorage.setItem("pmorph_last_project", projectId); } catch {}
+    const id = pick.kind === "task"
+      ? addStandaloneTask(projectId, "", pick.day)
+      : addExperimentRange(projectId, "", pick.start, pick.end);
+    compactRowHintRef.current[id] = pick.row; // appears in the row where it was clicked
+    setTimeout(() => { skipNextDeselectRef.current = false; }, 0); // the dialog click already ended
   }
 
   function updateExperimentDesc(projectId: string, itemId: string, desc: string) {
@@ -5014,7 +5102,8 @@ useEffect(() => {
       const pIdx = next.findIndex((p) => p.id === projectId);
       if (pIdx === -1) return prev;
       const project = next[pIdx];
-      const lane = findLane(project, laneId);
+      // The lane that holds the experiment now (in the compact view it may have moved during the resize)
+      const lane = project.lanes.find((l) => l.items.some((it) => it.id === expId)) ?? findLane(project, laneId);
       if (!lane) return prev;
       const exp = lane.items.find((it) => it.id === expId);
       if (!exp || exp.type !== "experiment") return prev;
@@ -5034,10 +5123,15 @@ useEffect(() => {
       }
 
       const updated: LaneItem = { ...exp, start: ns, end: ne };
-      if (!canPlaceInLane(lane, updated, exp.id)) return prev;
+      if (!canPlaceInLane(lane, updated, exp.id)) {
+        // Compact view hides the project's own lanes, so there the experiment just moves to a free lane
+        if (viewMode !== "compact") return prev;
+        next[pIdx] = placeItemPacked(project, lane.id, updated, exp.id);
+        return next;
+      }
 
       const newLane = upsertIntoLane(lane, updated, exp.id);
-      const newLanes = project.lanes.map((l) => (l.id === laneId ? newLane : l));
+      const newLanes = project.lanes.map((l) => (l.id === lane.id ? newLane : l));
       next[pIdx] = { ...project, lanes: newLanes };
       return next;
     });
@@ -5126,7 +5220,7 @@ useEffect(() => {
 
   // Re-measure plan width after view switches (DOM may not have updated yet on first render)
   useEffect(() => {
-    if (viewMode !== "plan") return;
+    if (viewMode !== "plan" && viewMode !== "compact") return;
     // Use rAF to let React finish rendering the plan grid before measuring
     const id = requestAnimationFrame(() => {
       const id2 = requestAnimationFrame(() => measurePlanW());
@@ -5268,6 +5362,60 @@ useEffect(() => {
     const min = isMobile ? (windowLen === 28 ? 28 : windowLen === 14 ? 40 : 48) : (windowLen === 28 ? 36 : windowLen === 14 ? 60 : 80);
     return Math.floor(Math.max(min, raw));
   }, [planW, days.length, windowLen, isMobile]);
+
+  // Compact view: items of all projects packed into as few rows as possible.
+  // Each item remembers its row (compactRowHintRef) and keeps it while it still fits,
+  // so adding or moving one item does not reshuffle the others.
+  const compactRows = useMemo(() => {
+    const sources: Record<string, { project: Project; laneId: string }> = {};
+    const items: LaneItem[] = [];
+    const first = days[0];
+    const last = days[days.length - 1];
+    for (const p of projects) {
+      for (const l of p.lanes) {
+        for (const it of l.items) {
+          if (compareDay(it.end, first) < 0 || compareDay(last, it.start) < 0) continue;
+          sources[it.id] = { project: p, laneId: l.id };
+          items.push(it);
+        }
+      }
+    }
+    for (const r of planRecurringInstances) {
+      const p = projects.find((pp) => pp.id === r.projectId);
+      if (!p) continue;
+      sources[r.id] = { project: p, laneId: `__rec_${p.id}` };
+      items.push({ id: r.id, type: "task", title: r.title, start: r.day, end: r.day });
+    }
+
+    // Only the shown part of an item takes room
+    const clip = (it: LaneItem) => ({
+      start: compareDay(it.start, first) < 0 ? first : it.start,
+      end: compareDay(it.end, last) > 0 ? last : it.end,
+    });
+    const fits = (row: LaneItem[], it: LaneItem) => row.every((o) => !overlaps(clip(o), clip(it)));
+    const order = (a: LaneItem, b: LaneItem) =>
+      compareDay(a.start, b.start) || diffDays(b.start, b.end) - diffDays(a.start, a.end) || a.id.localeCompare(b.id);
+
+    const hints = compactRowHintRef.current;
+    const rows: LaneItem[][] = [];
+    const later: LaneItem[] = [];
+    const hinted = items.filter((it) => hints[it.id] !== undefined).sort((a, b) => hints[a.id] - hints[b.id] || order(a, b));
+    for (const it of hinted) {
+      const h = hints[it.id];
+      while (rows.length <= h) rows.push([]);
+      if (fits(rows[h], it)) rows[h].push(it);
+      else later.push(it);
+    }
+    const fresh = items.filter((it) => hints[it.id] === undefined);
+    for (const it of [...later, ...fresh].sort(order)) {
+      let i = rows.findIndex((r) => fits(r, it));
+      if (i === -1) { rows.push([]); i = rows.length - 1; }
+      rows[i].push(it);
+    }
+    const packed = rows.filter((r) => r.length).map((r) => sortLaneItems(r));
+    packed.forEach((r, i) => r.forEach((it) => { hints[it.id] = i; }));
+    return { rows: packed, sources };
+  }, [projects, planRecurringInstances, days]);
 
   if (loadingAuth) {
     return <div style={{ padding: 16 }}>Loading…</div>;
@@ -5418,10 +5566,10 @@ useEffect(() => {
             /* Mobile landscape: single row */
             <div className="flex items-center gap-1 flex-wrap">
               <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
-                {(["plan", "calendar", "agenda"] as const).map((v) => (
+                {(["plan", "compact", "calendar", "agenda"] as const).map((v) => (
                   <button key={v} className="rounded-lg px-2 py-1 text-xs hover:opacity-80"
                     style={viewMode === v ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
-                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}</button>
+                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "compact" ? "Comp" : v === "calendar" ? "Cal" : "Agenda"}</button>
                 ))}
               </div>
               <div className="flex items-center gap-0.5">
@@ -5451,10 +5599,10 @@ useEffect(() => {
             <>
             <div className="flex items-center gap-1 mb-1">
               <div className="flex items-center gap-0 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
-                {(["plan", "calendar", "agenda"] as const).map((v) => (
+                {(["plan", "compact", "calendar", "agenda"] as const).map((v) => (
                   <button key={v} className="rounded-lg px-2 py-1 text-xs hover:opacity-80"
                     style={viewMode === v ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { color: 'var(--pp-text)' }}
-                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Cal" : "Agenda"}</button>
+                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "compact" ? "Comp" : v === "calendar" ? "Cal" : "Agenda"}</button>
                 ))}
               </div>
               <div className="flex items-center gap-0.5">
@@ -5489,10 +5637,10 @@ useEffect(() => {
           <div className="flex items-center gap-1.5 flex-wrap" data-print-hide>
               {/* Desktop: View mode toggle */}
               <div className="flex items-center gap-0.5 rounded-xl border p-0.5 shadow-sm dm-card" style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}>
-                {(["plan", "calendar", "agenda"] as const).map((v) => (
+                {(["plan", "compact", "calendar", "agenda"] as const).map((v) => (
                   <button key={v} className="rounded-lg px-3 py-1.5 text-sm hover:opacity-80"
                     style={viewMode === v ? { background: 'var(--pp-text)', color: 'var(--pp-bg)' } : { background: 'var(--pp-surface)', color: 'var(--pp-text)' }}
-                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "calendar" ? "Calendar" : "Agenda"}</button>
+                    onClick={() => setViewMode(v)}>{v === "plan" ? "Plan" : v === "compact" ? "Compact" : v === "calendar" ? "Calendar" : "Agenda"}</button>
                 ))}
               </div>
               {/* Desktop: Navigation */}
@@ -5532,7 +5680,7 @@ useEffect(() => {
         </div>
 
         {/* ---- PLAN VIEW ---- */}
-        {viewMode === "plan" && (() => {
+        {(viewMode === "plan" || viewMode === "compact") && (() => {
           // Inject planRecurring as actual lane items (not floating badges)
           const projectsWithRecurring = projects.map((proj) => {
             const recItemsForProject = planRecurringInstances
@@ -5572,6 +5720,50 @@ useEffect(() => {
             return { ...proj, lanes: updatedLanes };
           });
           
+          // Props shared by the lane rows of the plan and the rows of the compact view
+          const rowProps = {
+            days,
+            cellW,
+            dragCreate,
+            resizeExp,
+            onUpdateRange: updateRange,
+            onFinishRange: finishRange,
+            onStartResize: startResize,
+            onUpdateResize: updateResize,
+            onFinishResize: finishResize,
+            selection,
+            onSelectItem: selectItem,
+            onDeleteItem: deleteItem,
+            onUpdateTitle: updateItemTitle,
+            onUpdateDesc: updateExperimentDesc,
+            onClearSelection: () => setSelection(null),
+            onAddSubTask: addExperimentSubTask,
+            onSelectSubTask: selectSubTask,
+            onUpdateSubTaskTitle: updateExperimentSubTaskTitle,
+            onDeleteSubTask: deleteExperimentSubTask,
+            onCopyExperiment: copyExperiment,
+            onStartLink: (itemId: string) => { setSelection(null); setLinkFrom(itemId); },
+            planRecurringInstances,
+            onOpenDetail: (target: DetailTarget) => setDetailTarget(target),
+          };
+
+          // Compact view: arrows only of the hovered or selected item (an experiment counts with its sub-tasks)
+          const arrowFocus = (() => {
+            if (viewMode !== "compact") return null;
+            const ids = new Set<string>();
+            const addWithSubs = (id: string | null | undefined) => {
+              if (!id) return;
+              ids.add(id);
+              const it = compactRows.sources[id]?.project.lanes.flatMap((l) => l.items).find((x) => x.id === id);
+              if (it?.type === "experiment") Object.values(it.subTasks).flat().forEach((st) => ids.add(st.id));
+            };
+            addWithSubs(hoverItemId);
+            addWithSubs(linkFrom);
+            if (selection?.kind === "item") addWithSubs(selection.itemId);
+            if (selection?.kind === "subtask") ids.add(selection.subTaskId);
+            return ids;
+          })();
+
           return (
           <div className="mt-4 flex min-h-0 flex-1 flex-col" data-plan-view>
             <div
@@ -5673,7 +5865,34 @@ useEffect(() => {
                       >+ Create project</button>
                     </div>
                   )}
-                  {projectsWithRecurring.map((project) => {
+                  {/* Compact view: rows mixing all projects, told apart by color */}
+                  {viewMode === "compact" && projects.length > 0 && (
+                    <div
+                      onPointerOver={(e) => {
+                        const t = e.target as Element;
+                        if (t.closest("[data-link-arrows]")) return; // keep the arrow shown while it is pointed at
+                        const id = t.closest("[data-item-id]")?.getAttribute("data-item-id") ?? null;
+                        if (id !== hoverItemId) setHoverItemId(id);
+                      }}
+                      onPointerLeave={() => setHoverItemId(null)}
+                    >
+                      {[...compactRows.rows, []].map((items, i) => {
+                        const lane: Lane = { id: `${COMPACT_ROW}${i}`, items };
+                        return (
+                          <LaneRow
+                            key={lane.id}
+                            project={COMPACT_PROJECT}
+                            lane={lane}
+                            sources={compactRows.sources}
+                            {...rowProps}
+                            onStartRange={(day, pid) => startRange(COMPACT_ID, lane.id, day, pid)}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {viewMode === "plan" && projectsWithRecurring.map((project) => {
                     const isCollapsed = !!collapsedProjects[project.id];
                     return (
                     <div key={project.id}>
@@ -5835,36 +6054,8 @@ useEffect(() => {
                           key={lane.id}
                           project={project}
                           lane={lane}
-                          days={days}
-                          cellW={cellW}
-                          dragCreate={dragCreate}
-                          resizeExp={resizeExp}
+                          {...rowProps}
                           onStartRange={(day, pid) => startRange(project.id, lane.id, day, pid)}
-                          onUpdateRange={updateRange}
-                          onFinishRange={(pid, day, expId) => finishRange(pid, day, expId)}
-                          onStartResize={(expId, edge, pid) => startResize(project.id, lane.id, expId, edge, pid)}
-                          onUpdateResize={updateResize}
-                          onFinishResize={finishResize}
-                          selection={selection}
-                          onSelectItem={(projId, itemId) => {
-                            if (linkFrom) { if (!itemId.startsWith("pr:")) finishLink(itemId); return; }
-                            setSelection({ kind: "item", projectId: projId, itemId });
-                          }}
-                          onDeleteItem={deleteItem}
-                          onUpdateTitle={updateItemTitle}
-                          onUpdateDesc={updateExperimentDesc}
-                          onClearSelection={() => setSelection(null)}
-                          onAddSubTask={(expId, day) => addExperimentSubTask(project.id, lane.id, expId, day)}
-                          onSelectSubTask={(expId, stId) => {
-                            if (linkFrom) { finishLink(stId); return; }
-                            setSelection({ kind: "subtask", projectId: project.id, experimentId: expId, subTaskId: stId });
-                          }}
-                          onUpdateSubTaskTitle={(expId, stId, title) => updateExperimentSubTaskTitle(project.id, expId, stId, title)}
-                          onDeleteSubTask={(expId, stId) => deleteExperimentSubTask(project.id, expId, stId)}
-                          onCopyExperiment={(expId) => copyExperiment(project.id, expId)}
-                          onStartLink={(itemId) => { setSelection(null); setLinkFrom(itemId); }}
-                          planRecurringInstances={planRecurringInstances}
-                          onOpenDetail={(target) => setDetailTarget(target)}
                         />
                       ));
                       })()}
@@ -5877,6 +6068,7 @@ useEffect(() => {
                     projects={projects}
                     days={days}
                     selectedId={selectedLinkId}
+                    onlyFor={arrowFocus}
                     onSelect={setSelectedLinkId}
                     onDelete={(id) => { setLinks((prev) => prev.filter((l) => l.id !== id)); setSelectedLinkId(null); }}
                   />
@@ -6140,6 +6332,46 @@ useEffect(() => {
             </div>
           </div>
         )}
+
+        {/* ---- PROJECT PICKER (new item from the compact view) ---- */}
+        {projectPick && (() => {
+          const preferred = projects.find((p) => p.id === lastProjectId)?.id ?? projects[0]?.id;
+          return (
+            <div
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4"
+              onClick={(e) => { e.stopPropagation(); setProjectPick(null); }}
+              onKeyDown={(e) => { if (e.key === "Escape") setProjectPick(null); }}
+            >
+              <div
+                className="w-full max-w-xs rounded-2xl border p-3 shadow-xl"
+                style={{ background: 'var(--pp-surface)', borderColor: 'var(--pp-border)' }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="mb-2 text-sm font-semibold" style={{ color: 'var(--pp-text)' }}>
+                  {projectPick.kind === "task" ? "New task" : "New experiment"} – project
+                </div>
+                <div className="max-h-[60vh] space-y-1 overflow-auto">
+                  {projects.map((p) => (
+                    <button
+                      key={p.id}
+                      autoFocus={p.id === preferred}
+                      className="flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-sm hover:opacity-80 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                      style={{
+                        borderColor: p.id === preferred ? p.color : 'var(--pp-border)',
+                        background: p.id === preferred ? p.color + "1a" : 'var(--pp-surface)',
+                        color: 'var(--pp-text)',
+                      }}
+                      onClick={() => createPicked(projectPick, p.id)}
+                    >
+                      <span className="h-3 w-3 flex-shrink-0 rounded-full" style={{ background: p.color }} />
+                      <span className="truncate">{p.name}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* ---- ADD TASK MODAL ---- */}
         {addTaskModal && (
